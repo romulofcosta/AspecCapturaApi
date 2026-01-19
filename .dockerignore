@@ -1,0 +1,7 @@
+**/.dockerignore
+**/.env
+**/obj/
+**/bin/
+**/.git/
+**/.vscode/
+**/Dockerfile
