@@ -13,15 +13,34 @@ var awsOptions = builder.Configuration.GetAWSOptions();
 builder.Services.AddDefaultAWSOptions(awsOptions);
 builder.Services.AddAWSService<IAmazonS3>();
 
-// CORS
+// CORS Configuration
+// Define allowed origins for the Blazor PWA frontend
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("AllowAll",
-        builder =>
+    options.AddPolicy("AllowSpecificOrigins",
+        corsBuilder =>
         {
-            builder.AllowAnyOrigin()
-                   .AllowAnyMethod()
-                   .AllowAnyHeader();
+            // Production origin (Cloudflare Pages deployment)
+            var allowedOrigins = new List<string>
+            {
+                "https://pwa-camera-poc-blazor.pages.dev"
+            };
+
+            // Add localhost origins for development
+            if (builder.Environment.IsDevelopment())
+            {
+                allowedOrigins.Add("https://localhost:5001");
+                allowedOrigins.Add("http://localhost:5000");
+                allowedOrigins.Add("https://localhost:7001");
+                allowedOrigins.Add("http://localhost:7000");
+                allowedOrigins.Add("http://localhost:5230");
+                allowedOrigins.Add("https://localhost:5231");
+            }
+
+            corsBuilder.WithOrigins(allowedOrigins.ToArray())
+                       .AllowAnyMethod()
+                       .AllowAnyHeader()
+                       .AllowCredentials(); // Important for authentication cookies/tokens
         });
 });
 
@@ -35,7 +54,7 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
-app.UseCors("AllowAll");
+app.UseCors("AllowSpecificOrigins");
 
 // Redirect root to Swagger UI
 app.MapGet("/", () => Results.Redirect("/swagger"));
@@ -47,7 +66,7 @@ app.MapPost("/api/storage/presigned-url", async ([FromBody] PresignedUrlRequest 
     {
         return Results.Problem("AWS BucketName not configured.");
     }
-    
+
     // Use AssetId as folder if provided, otherwise 'temp'
     var folder = !string.IsNullOrEmpty(request.AssetId) ? request.AssetId : "temp";
     var key = $"{folder}/{request.FileName}";
@@ -68,15 +87,15 @@ app.MapPost("/api/storage/presigned-url", async ([FromBody] PresignedUrlRequest 
     {
         presignedUrlRequest.Metadata.Add("asset-code", request.AssetCode);
     }
-    
+
     string url = "";
-    try 
+    try
     {
         url = s3Client.GetPreSignedURL(presignedUrlRequest);
     }
     catch (Exception ex)
     {
-         return Results.Problem($"Error generating URL: {ex.Message}");
+        return Results.Problem($"Error generating URL: {ex.Message}");
     }
 
     return Results.Ok(new PresignedUrlResponse(url, key));
