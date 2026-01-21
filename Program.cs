@@ -10,6 +10,14 @@ builder.Services.AddSwaggerGen();
 
 // AWS Configuration
 var awsOptions = builder.Configuration.GetAWSOptions();
+var accessKey = builder.Configuration["AWS:AccessKey"];
+var secretKey = builder.Configuration["AWS:SecretKey"];
+
+if (!string.IsNullOrEmpty(accessKey) && !string.IsNullOrEmpty(secretKey))
+{
+    awsOptions.Credentials = new Amazon.Runtime.BasicAWSCredentials(accessKey, secretKey);
+}
+
 builder.Services.AddDefaultAWSOptions(awsOptions);
 builder.Services.AddAWSService<IAmazonS3>();
 
@@ -59,6 +67,44 @@ app.UseCors("AllowSpecificOrigins");
 // Redirect root to Swagger UI
 app.MapGet("/", () => Results.Redirect("/swagger"));
 
+// Auto-configure S3 CORS for Browser Direct Uploads
+using (var scope = app.Services.CreateScope())
+{
+    var s3 = scope.ServiceProvider.GetRequiredService<IAmazonS3>();
+    var config = scope.ServiceProvider.GetRequiredService<IConfiguration>();
+    var bucketName = config["AWS:BucketName"];
+
+    if (!string.IsNullOrEmpty(bucketName))
+    {
+        try
+        {
+            await s3.PutCORSConfigurationAsync(new PutCORSConfigurationRequest
+            {
+                BucketName = bucketName,
+                Configuration = new CORSConfiguration
+                {
+                    Rules = new List<CORSRule>
+                    {
+                        new CORSRule
+                        {
+                            AllowedMethods = new List<string> { "GET", "PUT", "POST", "HEAD", "DELETE" },
+                            AllowedOrigins = new List<string> { "*" }, // For Dev/PoC only. In Prod restrict to domain.
+                            AllowedHeaders = new List<string> { "*" },
+                            ExposeHeaders = new List<string> { "ETag", "x-amz-meta-asset-code" },
+                            MaxAgeSeconds = 3000
+                        }
+                    }
+                }
+            });
+            Console.WriteLine($"✅ S3 CORS Configured for bucket {bucketName}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠️ Failed to configure S3 CORS (Check permissions): {ex.Message}");
+        }
+    }
+}
+
 app.MapPost("/api/storage/presigned-url", async ([FromBody] PresignedUrlRequest request, [FromServices] IAmazonS3 s3Client, [FromServices] IConfiguration configuration) =>
 {
     var bucketName = configuration["AWS:BucketName"];
@@ -101,6 +147,29 @@ app.MapPost("/api/storage/presigned-url", async ([FromBody] PresignedUrlRequest 
     return Results.Ok(new PresignedUrlResponse(url, key));
 })
 .WithName("GetPresignedUrl")
+.WithOpenApi();
+
+app.MapGet("/api/storage/exists/{*key}", async (string key, [FromServices] IAmazonS3 s3Client, [FromServices] IConfiguration configuration) =>
+{
+    var bucketName = configuration["AWS:BucketName"];
+    if (string.IsNullOrEmpty(bucketName)) return Results.Problem("Bucket not configured");
+
+    try
+    {
+        // Check if the object exists by fetching metadata
+        await s3Client.GetObjectMetadataAsync(bucketName, key);
+        return Results.Ok(new { exists = true, key = key });
+    }
+    catch (Amazon.S3.AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+    {
+        return Results.NotFound(new { exists = false, key = key });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(ex.Message);
+    }
+})
+.WithName("CheckObjectExists")
 .WithOpenApi();
 
 app.Run();
