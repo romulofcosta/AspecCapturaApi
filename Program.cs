@@ -1,6 +1,8 @@
 using Amazon.S3;
 using Amazon.S3.Model;
 using Microsoft.AspNetCore.Mvc;
+using pwa_camera_poc_api.Middleware;
+using pwa_camera_poc_api.Models;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -53,6 +55,9 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 app.UseCors("AllowSpecificOrigins");
+
+// v1.5.0: Register API Key Auth Middleware for /api/v2/* endpoints
+app.UseMiddleware<ApiKeyAuthMiddleware>();
 
 // Redirect root to Swagger UI
 app.MapGet("/", () => Results.Redirect("/swagger"));
@@ -213,6 +218,93 @@ app.MapGet("/api/storage/exists/{*filePath}", async (string filePath, [FromServi
 })
 .WithName("CheckObjectExists")
 .WithOpenApi();
+
+// v1.5.0 API v2 Endpoints - Provisioning
+// GET /api/v2/inventario/carga/{ugId} - Returns Pre-Signed URL to inventory JSON
+app.MapGet("/api/v2/inventario/carga/{ugId}", async (int ugId, [FromServices] IAmazonS3 s3Client, [FromServices] IConfiguration config, [FromServices] ILogger<Program> logger) =>
+{
+    try
+    {
+        var bucketName = config["AWS:BucketName"] ?? "aspec-capture";
+        var s3CargasPath = config["AWS:S3Paths:Cargas"] ?? "cargas";
+        var key = $"{s3CargasPath}/ug_{ugId}_itens.json";
+
+        logger.LogInformation($"[v2 API] Generating Pre-Signed URL for inventory carga: {key}");
+
+        var presignedUrlRequest = new GetPreSignedUrlRequest
+        {
+            BucketName = bucketName,
+            Key = key,
+            Verb = HttpVerb.GET,
+            Expires = DateTime.UtcNow.AddMinutes(30)
+        };
+
+        var presignedUrl = s3Client.GetPreSignedURL(presignedUrlRequest);
+
+        return Results.Ok(new ProvisioningUrlResponseDto
+        {
+            PresignedUrl = presignedUrl,
+            Key = key,
+            Bucket = bucketName,
+            GeneratedAt = DateTime.UtcNow,
+            ExpiresAt = DateTime.UtcNow.AddMinutes(30),
+            ContentType = "application/json"
+        });
+    }
+    catch (Exception ex)
+    {
+        logger.LogError($"[v2 API] Error generating inventory URL: {ex.Message}");
+        return Results.StatusCode(StatusCodes.Status500InternalServerError);
+    }
+})
+.WithName("GetInventorioCarga")
+.WithOpenApi()
+.Produces<ProvisioningUrlResponseDto>(StatusCodes.Status200OK)
+.Produces(StatusCodes.Status401Unauthorized)
+.Produces(StatusCodes.Status500InternalServerError);
+
+// GET /api/v2/auth/usuarios/{ugId} - Returns Pre-Signed URL to users JSON
+app.MapGet("/api/v2/auth/usuarios/{ugId}", async (int ugId, [FromServices] IAmazonS3 s3Client, [FromServices] IConfiguration config, [FromServices] ILogger<Program> logger) =>
+{
+    try
+    {
+        var bucketName = config["AWS:BucketName"] ?? "aspec-capture";
+        var s3CargasPath = config["AWS:S3Paths:Cargas"] ?? "cargas";
+        var key = $"{s3CargasPath}/ug_{ugId}_users.json";
+
+        logger.LogInformation($"[v2 API] Generating Pre-Signed URL for users: {key}");
+
+        var presignedUrlRequest = new GetPreSignedUrlRequest
+        {
+            BucketName = bucketName,
+            Key = key,
+            Verb = HttpVerb.GET,
+            Expires = DateTime.UtcNow.AddMinutes(30)
+        };
+
+        var presignedUrl = s3Client.GetPreSignedURL(presignedUrlRequest);
+
+        return Results.Ok(new ProvisioningUrlResponseDto
+        {
+            PresignedUrl = presignedUrl,
+            Key = key,
+            Bucket = bucketName,
+            GeneratedAt = DateTime.UtcNow,
+            ExpiresAt = DateTime.UtcNow.AddMinutes(30),
+            ContentType = "application/json"
+        });
+    }
+    catch (Exception ex)
+    {
+        logger.LogError($"[v2 API] Error generating users URL: {ex.Message}");
+        return Results.StatusCode(StatusCodes.Status500InternalServerError);
+    }
+})
+.WithName("GetUsuarios")
+.WithOpenApi()
+.Produces<ProvisioningUrlResponseDto>(StatusCodes.Status200OK)
+.Produces(StatusCodes.Status401Unauthorized)
+.Produces(StatusCodes.Status500InternalServerError);
 
 app.Run();
 

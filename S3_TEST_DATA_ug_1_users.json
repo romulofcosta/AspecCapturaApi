@@ -1,0 +1,29 @@
+[
+  {
+    "nomeUsuario": "admin",
+    "primeiroNome": "Administrador",
+    "ultimoNome": "do Sistema",
+    "hashSenha": "$argon2id$v=19$m=65536,t=3,p=4$YWJjZGVmZ2hpams=$QPwBPm4FsYQvl3yAz7tH0ItKxRvJ7mLBHdHMLYbL1As",
+    "idsUnidadesGestoras": [1],
+    "unidadeGestoraAtualId": 1,
+    "dataCriacao": "2026-01-01T00:00:00Z"
+  },
+  {
+    "nomeUsuario": "joao.silva",
+    "primeiroNome": "João",
+    "ultimoNome": "Silva",
+    "hashSenha": "$argon2id$v=19$m=65536,t=3,p=4$YWJjZGVmZ2hpams=$QPwBPm4FsYQvl3yAz7tH0ItKxRvJ7mLBHdHMLYbL1As",
+    "idsUnidadesGestoras": [1, 2],
+    "unidadeGestoraAtualId": 1,
+    "dataCriacao": "2026-01-10T10:00:00Z"
+  },
+  {
+    "nomeUsuario": "maria.santos",
+    "primeiroNome": "Maria",
+    "ultimoNome": "Santos",
+    "hashSenha": "$argon2id$v=19$m=65536,t=3,p=4$YWJjZGVmZ2hpams=$QPwBPm4FsYQvl3yAz7tH0ItKxRvJ7mLBHdHMLYbL1As",
+    "idsUnidadesGestoras": [1],
+    "unidadeGestoraAtualId": 1,
+    "dataCriacao": "2026-01-15T14:30:00Z"
+  }
+]
