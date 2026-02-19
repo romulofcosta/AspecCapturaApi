@@ -33,8 +33,8 @@ builder.Services.AddCors(options =>
                            // Allow any origin in Development to fix local PWA access
                            if (builder.Environment.IsDevelopment()) return true;
 
-                           // Production origins
-                           return origin == "https://pwa-camera-poc-blazor.pages.dev";
+                           // Permite produção e todos os previews do Cloudflare Pages
+                           return origin.EndsWith(".pwa-camera-poc-blazor.pages.dev");
                        })
                        .AllowAnyMethod()
                        .AllowAnyHeader()
