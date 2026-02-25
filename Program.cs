@@ -1,14 +1,23 @@
 using Amazon.S3;
 using Amazon.S3.Model;
 using Microsoft.AspNetCore.Mvc;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
+// ─── Logging Estruturado ───────────────────────────────────────────────────────
+builder.Logging.ClearProviders();
+builder.Logging.AddConsole();
 
-// AWS Configuration
+// ─── Serviços ─────────────────────────────────────────────────────────────────
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(c =>
+{
+    c.SwaggerDoc("v1", new() { Title = "ASPEC Capture API", Version = "v1" });
+});
+
+// ─── AWS ──────────────────────────────────────────────────────────────────────
 var awsOptions = builder.Configuration.GetAWSOptions();
 var accessKey = builder.Configuration["AWS:AccessKey"];
 var secretKey = builder.Configuration["AWS:SecretKey"];
@@ -21,35 +30,61 @@ if (!string.IsNullOrEmpty(accessKey) && !string.IsNullOrEmpty(secretKey))
 builder.Services.AddDefaultAWSOptions(awsOptions);
 builder.Services.AddAWSService<IAmazonS3>();
 
-// CORS Configuration
-// Define allowed origins for the Blazor PWA frontend
+// ─── CORS ─────────────────────────────────────────────────────────────────────
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("AllowSpecificOrigins",
-        corsBuilder =>
-        {
-            corsBuilder.SetIsOriginAllowed(origin =>
-                       {
-                           // Allow any origin in Development to fix local PWA access
-                           if (builder.Environment.IsDevelopment()) return true;
-
-                           // Permite produção e todos os previews do Cloudflare Pages
-                           return origin.EndsWith(".pwa-camera-poc-blazor.pages.dev");
-                       })
-                       .AllowAnyMethod()
-                       .AllowAnyHeader()
-                       .AllowCredentials(); // Important for authentication cookies/tokens
-        });
+    options.AddPolicy("AllowSpecificOrigins", corsBuilder =>
+    {
+        corsBuilder
+            .SetIsOriginAllowed(origin =>
+            {
+                if (builder.Environment.IsDevelopment()) return true;
+                return origin.EndsWith(".pwa-camera-poc-blazor.pages.dev");
+            })
+            .AllowAnyMethod()
+            .AllowAnyHeader()
+            .AllowCredentials();
+    });
 });
 
-var app = builder.Build();
+// ─── JSON Options globais (case-insensitive) ──────────────────────────────────
+var jsonOptions = new JsonSerializerOptions
+{
+    PropertyNameCaseInsensitive = true,
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+};
 
-// Configure the HTTP request pipeline.
+var app = builder.Build();
+var logger = app.Services.GetRequiredService<ILogger<Program>>();
+
+// ─── Pipeline ─────────────────────────────────────────────────────────────────
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
-    app.UseSwaggerUI();
+    app.UseSwaggerUI(c =>
+    {
+        c.SwaggerEndpoint("/swagger/v1/swagger.json", "ASPEC Capture API v1");
+        c.RoutePrefix = "swagger";
+        c.DisplayRequestDuration();
+    });
 }
+
+// Middleware global de exceções
+app.UseExceptionHandler(errApp =>
+{
+    errApp.Run(async context =>
+    {
+        context.Response.StatusCode = 500;
+        context.Response.ContentType = "application/json";
+        var feature = context.Features.Get<Microsoft.AspNetCore.Diagnostics.IExceptionHandlerFeature>();
+        if (feature?.Error is { } ex)
+        {
+            logger.LogError(ex, "Unhandled exception: {Message}", ex.Message);
+            await context.Response.WriteAsJsonAsync(new { error = "Erro interno do servidor.", detail = app.Environment.IsDevelopment() ? ex.Message : null });
+        }
+    });
+});
 
 app.UseHttpsRedirection();
 app.UseCors("AllowSpecificOrigins");
@@ -57,238 +92,450 @@ app.UseCors("AllowSpecificOrigins");
 // Redirect root to Swagger UI
 app.MapGet("/", () => Results.Redirect("/swagger"));
 
-// Auto-configure S3 CORS for Browser Direct Uploads
+// ─── Auto-configure S3 CORS (startup) ────────────────────────────────────────
 try
 {
-    using (var scope = app.Services.CreateScope())
-    {
-        var config = scope.ServiceProvider.GetRequiredService<IConfiguration>();
-        var bucketName = config["AWS:BucketName"];
-        var region = config["AWS:Region"];
+    using var scope = app.Services.CreateScope();
+    var config = scope.ServiceProvider.GetRequiredService<IConfiguration>();
+    var bucketName = config["AWS:BucketName"];
+    var region = config["AWS:Region"];
 
-        // Only attempt if not using placeholders
-        if (!string.IsNullOrEmpty(bucketName) && bucketName != "AWS__BucketName" &&
-            !string.IsNullOrEmpty(region) && region != "AWS__Region")
+    if (!string.IsNullOrEmpty(bucketName) && bucketName != "AWS__BucketName" &&
+        !string.IsNullOrEmpty(region) && region != "AWS__Region")
+    {
+        var s3 = scope.ServiceProvider.GetRequiredService<IAmazonS3>();
+        await s3.PutCORSConfigurationAsync(new PutCORSConfigurationRequest
         {
-            var s3 = scope.ServiceProvider.GetRequiredService<IAmazonS3>();
-            await s3.PutCORSConfigurationAsync(new PutCORSConfigurationRequest
+            BucketName = bucketName,
+            Configuration = new CORSConfiguration
             {
-                BucketName = bucketName,
-                Configuration = new CORSConfiguration
-                {
-                    Rules = new List<CORSRule>
+                Rules =
+                [
+                    new CORSRule
                     {
-                        new CORSRule
-                        {
-                            AllowedMethods = new List<string> { "GET", "PUT", "POST", "HEAD", "DELETE" },
-                            AllowedOrigins = new List<string> { "*" }, // For Dev/PoC only. In Prod restrict to domain.
-                            AllowedHeaders = new List<string> { "*" }, // Allows Content-Type and others
-                            ExposeHeaders = new List<string> { "ETag", "x-amz-meta-asset-code" },
-                            MaxAgeSeconds = 3000
-                        }
+                        AllowedMethods = ["GET", "PUT", "POST", "HEAD", "DELETE"],
+                        AllowedOrigins = ["*"],
+                        AllowedHeaders = ["*"],
+                        ExposeHeaders = ["ETag", "x-amz-meta-asset-code"],
+                        MaxAgeSeconds = 3000
                     }
-                }
-            });
-            Console.WriteLine($"✅ S3 CORS Configured for bucket {bucketName}");
-        }
-        else
-        {
-            Console.WriteLine("⚠️ AWS Configuration not fully set (placeholders detected). Skipping S3 CORS auto-config.");
-        }
+                ]
+            }
+        });
+        logger.LogInformation("S3 CORS configurado para bucket {Bucket}", bucketName);
+    }
+    else
+    {
+        logger.LogWarning("AWS não configurado completamente. Pulando S3 CORS auto-config.");
     }
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"⚠️ Failed to configure S3 CORS or AWS service: {ex.Message}");
+    logger.LogWarning(ex, "Falha ao configurar S3 CORS: {Message}", ex.Message);
 }
 
-app.MapPost("/api/storage/presigned-url", async ([FromBody] PresignedUrlRequest request, [FromServices] IAmazonS3 s3Client, [FromServices] IConfiguration configuration) =>
+// ─── ENDPOINT: Presigned URL ──────────────────────────────────────────────────
+app.MapPost("/api/storage/presigned-url", async (
+    [FromBody] PresignedUrlRequest request,
+    [FromServices] IAmazonS3 s3Client,
+    [FromServices] IConfiguration configuration,
+    ILogger<Program> log) =>
 {
     var bucketName = configuration["AWS:BucketName"];
     if (string.IsNullOrEmpty(bucketName))
-    {
-        return Results.Problem("AWS BucketName not configured.");
-    }
+        return Results.Problem("AWS BucketName não configurado.");
 
-    // Use AssetId as folder if provided, otherwise 'temp'
-    // Decode first in case the client sent encoded data
-    var rawFolder = !string.IsNullOrEmpty(request.AssetId) ? Uri.UnescapeDataString(request.AssetId) : "temp";
-
-    // Helper function to sanitize keys (remove accents, spaces to hyphens)
-    string SanitizeKey(string input)
+    static string SanitizeKey(string input)
     {
         if (string.IsNullOrEmpty(input)) return input;
-
-        // Normalize to FormD to split accents
-        var normalizedString = input.Normalize(System.Text.NormalizationForm.FormD);
-        var stringBuilder = new System.Text.StringBuilder();
-
-        foreach (var c in normalizedString)
+        var normalized = input.Normalize(System.Text.NormalizationForm.FormD);
+        var sb = new System.Text.StringBuilder();
+        foreach (var c in normalized)
         {
-            var unicodeCategory = System.Globalization.CharUnicodeInfo.GetUnicodeCategory(c);
-            if (unicodeCategory != System.Globalization.UnicodeCategory.NonSpacingMark)
-            {
-                stringBuilder.Append(c);
-            }
+            if (System.Globalization.CharUnicodeInfo.GetUnicodeCategory(c) !=
+                System.Globalization.UnicodeCategory.NonSpacingMark)
+                sb.Append(c);
         }
-
-        return stringBuilder.ToString().Normalize(System.Text.NormalizationForm.FormC)
-                            .Replace(" ", "-") // Spaces to hyphens
-                            .Replace("%20", "-") // Encoded spaces to hyphens
-                            .Replace("/", "-") // Slashes to hyphens
-                            .Replace("\\", "-");
+        return sb.ToString()
+                 .Normalize(System.Text.NormalizationForm.FormC)
+                 .Replace(" ", "-")
+                 .Replace("%20", "-")
+                 .Replace("/", "-")
+                 .Replace("\\", "-");
     }
 
-    // Split folder by '/' to sanitize each segment if it's a path
-    var folderSegments = rawFolder.Split('/');
-    var sanitizedFolder = string.Join("/", folderSegments.Select(s => SanitizeKey(s)));
-    var sanitizedFileName = SanitizeKey(request.FileName);
+    var rawFolder = !string.IsNullOrEmpty(request.AssetId)
+        ? Uri.UnescapeDataString(request.AssetId)
+        : "temp";
 
+    var sanitizedFolder = string.Join("/", rawFolder.Split('/').Select(SanitizeKey));
+    var sanitizedFileName = SanitizeKey(request.FileName);
     var key = $"{sanitizedFolder}/{sanitizedFileName}";
 
-    Console.WriteLine($"DEBUG: Generated Key for Pre-signed URL: {key}");
-
-    var expiryDuration = TimeSpan.FromMinutes(10);
+    log.LogDebug("Gerando Pre-signed URL para chave: {Key}", key);
 
     var presignedUrlRequest = new GetPreSignedUrlRequest
     {
         BucketName = bucketName,
         Key = key,
         Verb = HttpVerb.PUT,
-        Expires = DateTime.UtcNow.Add(expiryDuration),
+        Expires = DateTime.UtcNow.AddMinutes(10),
         ContentType = request.ContentType
     };
 
-    // Add metadata if needed
     if (!string.IsNullOrEmpty(request.AssetCode))
     {
-        Console.WriteLine($"DEBUG: Signing with asset-code: {request.AssetCode}");
+        log.LogDebug("Assinando com asset-code: {AssetCode}", request.AssetCode);
         presignedUrlRequest.Metadata.Add("asset-code", request.AssetCode);
     }
 
-    string url = "";
     try
     {
-        url = s3Client.GetPreSignedURL(presignedUrlRequest);
+        var url = s3Client.GetPreSignedURL(presignedUrlRequest);
+        return Results.Ok(new PresignedUrlResponse(url, key));
     }
     catch (Exception ex)
     {
-        return Results.Problem($"Error generating URL: {ex.Message}");
+        log.LogError(ex, "Erro ao gerar Pre-signed URL para {Key}", key);
+        return Results.Problem($"Erro ao gerar URL: {ex.Message}");
     }
-
-    return Results.Ok(new PresignedUrlResponse(url, key));
 })
 .WithName("GetPresignedUrl")
-.WithOpenApi();
+.WithOpenApi()
+.WithTags("Storage");
 
-app.MapGet("/api/storage/exists/{*filePath}", async (string filePath, [FromServices] IAmazonS3 s3Client, [FromServices] IConfiguration configuration) =>
+// ─── ENDPOINT: Verifica existência no S3 ─────────────────────────────────────
+app.MapGet("/api/storage/exists/{*filePath}", async (
+    string filePath,
+    [FromServices] IAmazonS3 s3Client,
+    [FromServices] IConfiguration configuration,
+    ILogger<Program> log) =>
 {
     var bucketName = configuration["AWS:BucketName"];
-    if (string.IsNullOrEmpty(bucketName)) return Results.Problem("Bucket not configured");
+    if (string.IsNullOrEmpty(bucketName))
+        return Results.Problem("Bucket não configurado.");
 
     try
     {
-        // Check if the object exists by fetching metadata
-        // {*filePath} is a catch-all that correctly handles slashes in the S3 key
         await s3Client.GetObjectMetadataAsync(bucketName, filePath);
-
         var region = configuration["AWS:Region"] ?? "us-east-1";
-        // Ensure the URL is properly constructed
         var url = $"https://{bucketName}.s3.{region}.amazonaws.com/{filePath}";
-
-        return Results.Ok(new { exists = true, key = filePath, url = url });
+        return Results.Ok(new { exists = true, key = filePath, url });
     }
-    catch (Amazon.S3.AmazonS3Exception ex)
+    catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
     {
-        if (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
-        {
-            return Results.Ok(new { exists = false, key = filePath });
-        }
-        // Return 404 for Forbidden as well, often implies object not found or no access
-        if (ex.StatusCode == System.Net.HttpStatusCode.Forbidden)
-        {
-            // Log the error but return "not found" or specific error to help debug
-            Console.WriteLine($"S3 Forbidden for key '{filePath}': {ex.Message}");
-            return Results.Problem($"Access Denied (Forbidden) for key: {filePath}. Ensure S3 permissions.", statusCode: 403);
-        }
-        return Results.Problem($"S3 Error: {ex.StatusCode} - {ex.Message}");
+        return Results.Ok(new { exists = false, key = filePath });
+    }
+    catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.Forbidden)
+    {
+        log.LogWarning("S3 Proibido para chave '{FilePath}': {Message}", filePath, ex.Message);
+        return Results.Problem($"Acesso negado para: {filePath}", statusCode: 403);
     }
     catch (Exception ex)
     {
+        log.LogError(ex, "Erro S3 ao verificar existência de {FilePath}", filePath);
         return Results.Problem(ex.Message);
     }
 })
 .WithName("CheckObjectExists")
-.WithOpenApi();
+.WithOpenApi()
+.WithTags("Storage");
 
-app.MapPost("/api/auth/login", async ([FromBody] LoginRequest request, [FromServices] IAmazonS3 s3Client, [FromServices] IConfiguration configuration) =>
+// ─── ENDPOINT: Login ──────────────────────────────────────────────────────────
+app.MapPost("/api/auth/login", async (
+    [FromBody] LoginRequest request,
+    [FromServices] IAmazonS3 s3Client,
+    [FromServices] IConfiguration configuration,
+    ILogger<Program> log) =>
 {
-    if (string.IsNullOrEmpty(request.Usuario) || string.IsNullOrEmpty(request.Senha))
-    {
-        return Results.BadRequest("Usuário e Senha são obrigatórios.");
-    }
+    if (string.IsNullOrWhiteSpace(request.Usuario) || string.IsNullOrWhiteSpace(request.Senha))
+        return Results.BadRequest(new { error = "Usuário e Senha são obrigatórios." });
 
     var bucketName = configuration["AWS:BucketName"];
-    if (string.IsNullOrEmpty(bucketName)) return Results.Problem("Bucket not configured");
+    if (string.IsNullOrEmpty(bucketName))
+        return Results.Problem("Bucket não configurado.");
 
-    // Parsing: CE305.joao.silva -> Prefix = CE305, Remaining = joao.silva
+    // Formato esperado: ce999.nome1.sbnome1
     var parts = request.Usuario.Split('.', 2);
     if (parts.Length < 2)
     {
-        return Results.Unauthorized(); // Formato inválido
+        log.LogWarning("Formato de usuário inválido: {Usuario}", request.Usuario);
+        return Results.BadRequest(new { error = "Formato de usuário inválido. Use: municipio.usuario" });
     }
 
     var prefix = parts[0].ToUpper();
-    var restOfUsername = parts[1].ToLower();
     var s3Key = $"usuarios/{prefix}.json";
+
+    log.LogInformation("Tentativa de login para município {Prefix}, usuário {Usuario}", prefix, request.Usuario);
 
     try
     {
-        // Download user list from S3
-        using var responseMessage = await s3Client.GetObjectAsync(bucketName, s3Key);
-        using var reader = new StreamReader(responseMessage.ResponseStream);
+        // 1. Carrega dados de usuário
+        using var s3Response = await s3Client.GetObjectAsync(bucketName, s3Key);
+        using var reader = new StreamReader(s3Response.ResponseStream);
         var json = await reader.ReadToEndAsync();
-
-        var users = System.Text.Json.JsonSerializer.Deserialize<List<UsuarioRecord>>(json, new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-
-        if (users == null) return Results.Unauthorized();
-
-        // Validação do usuário
-        var user = users.FirstOrDefault(u => u.Usuario.ToLower() == restOfUsername);
-        if (user == null || user.Senha != request.Senha)
+        var root = JsonSerializer.Deserialize<UnifiedDataRecord>(json, jsonOptions);
+        if (root?.Usuarios == null || root.Usuarios.Count == 0)
         {
+            log.LogWarning("Arquivo {S3Key} não contém usuários válidos.", s3Key);
             return Results.Unauthorized();
         }
+        var restOfUsername = parts[1].ToLower();
+        var user = root.Usuarios.FirstOrDefault(u =>
+            string.Equals(u.NmUsuario, request.Usuario, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(u.NmUsuario, restOfUsername, StringComparison.OrdinalIgnoreCase));
+        if (user is null)
+        {
+            log.LogWarning("Usuário '{Usuario}' não encontrado.", request.Usuario);
+            return Results.Unauthorized();
+        }
+        if (user.PwdUsuario != request.Senha)
+        {
+            log.LogWarning("Senha inválida para usuário '{Usuario}'.", request.Usuario);
+            return Results.Unauthorized();
+        }
+        log.LogInformation("Login bem-sucedido: {Usuario}, Esfera: {Esfera}", user.NmUsuario, user.Esfera);
 
-        // Resposta de sucesso com estrutura hierárquica completa
+        // 2. Carrega patrimônio completo do arquivo {prefix}_01.json
+        // var patrimonioKey = $"patrimonio/{prefix}_01.json";
+        // List<PatrimonioCargaItem> patrimonioCarga = new();
+        // try
+        // {
+        //     using var patrResp = await s3Client.GetObjectAsync(bucketName, patrimonioKey);
+        //     using var patrReader = new StreamReader(patrResp.ResponseStream);
+        //     var patrJson = await patrReader.ReadToEndAsync();
+        //     patrimonioCarga = JsonSerializer.Deserialize<List<PatrimonioCargaItem>>(patrJson, jsonOptions) ?? new();
+        // }
+        // catch (Exception ex)
+        // {
+        //     log.LogWarning(ex, "Falha ao carregar patrimônio completo do arquivo {PatrimonioKey}", patrimonioKey);
+        // }
+
+        // 3. Filtra patrimônio para a esfera do usuário
+        // var patrimonioFiltrado = user.Esfera == "A"
+        //     ? patrimonioCarga
+        //     : patrimonioCarga.Where(p => p.Esfera == user.Esfera).ToList();
+
+        var tombamentoBase = root.Tombamento ?? new List<TombamentoRecord>();
+        var tombamentoFiltrado = user.Esfera == "A"
+            ? tombamentoBase
+            : tombamentoBase.Where(p => p.Esfera == user.Esfera).ToList();
+
+        // 4. Filtra patrimônio para árvore de órgãos (dados de apoio)
+        var tabelas = root.Tabelas;
+        if (tabelas is null)
+        {
+            log.LogWarning("Seção 'tabelas' ausente no arquivo {S3Key}.", s3Key);
+            return Results.Problem("Dados de tabelas ausentes no arquivo do município.");
+        }
+        var orgaos = BuildOrgaoHierarchy(user.Esfera, tombamentoFiltrado.ToList(), tabelas);
+
+        // 5. Monta resposta
         return Results.Ok(new AuthResponse(
-            NomeCompleto: user.NomeCompleto,
+            NomeCompleto: user.NomeCompleto ?? user.NmUsuario,
             Prefixo: prefix,
-            Orgaos: user.Orgaos,
+            Esfera: user.Esfera,
+            Orgaos: orgaos,
+                Tombamento: tombamentoFiltrado.Select(p => new TombamentoItemResponse(p.IdPatomb, p.Nutomb, p.Esfera, p.Deprod)).ToList(),
             Token: Guid.NewGuid().ToString()
         ));
     }
     catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
     {
-        return Results.NotFound($"Configuração do município '{prefix}' não encontrada.");
+        log.LogWarning("Arquivo '{S3Key}' não encontrado no S3.", s3Key);
+        return Results.NotFound(new { error = $"Município '{prefix}' não encontrado." });
+    }
+    catch (JsonException ex)
+    {
+        log.LogError(ex, "Erro ao deserializar JSON do arquivo {S3Key}", s3Key);
+        return Results.Problem($"Formato de dados inválido para o município '{prefix}'.");
     }
     catch (Exception ex)
     {
-        return Results.Problem($"Erro de autenticação: {ex.Message}");
+        log.LogError(ex, "Erro inesperado no login para {Usuario}", request.Usuario);
+        return Results.Problem("Erro interno ao autenticar.");
     }
 })
 .WithName("Login")
-.WithOpenApi();
+.WithOpenApi()
+.WithTags("Auth");
 
 app.Run();
 
+// ─── Funções auxiliares ───────────────────────────────────────────────────────
+static List<OrgaoRecord> BuildOrgaoHierarchy(
+    string esfera,
+    List<TombamentoRecord> filteredTombamento,
+    TabelasRecord tabelas)
+{
+    var orgaos = new List<OrgaoRecord>();
+
+    var targetOrgaoCodes = esfera == "A"
+        ? tabelas.XxOrga.Select(o => o.CdOrgao).Distinct()
+        : filteredTombamento.Select(p => p.CdOrgao).Distinct();
+
+    foreach (var orgCode in targetOrgaoCodes)
+    {
+        var orgInfo = tabelas.XxOrga.FirstOrDefault(o => o.CdOrgao == orgCode);
+        if (orgInfo is null) continue;
+
+        var targetUoCodes = esfera == "A"
+            ? tabelas.XxUnid.Where(u => u.CdOrgao == orgCode).Select(u => u.CdUnid).Distinct()
+            : filteredTombamento.Where(p => p.CdOrgao == orgCode).Select(p => p.CdUnid).Distinct();
+
+        var uos = new List<UnidadeOrcamentariaRecord>();
+        foreach (var uoCode in targetUoCodes)
+        {
+            var uoInfo = tabelas.XxUnid.FirstOrDefault(u => u.CdOrgao == orgCode && u.CdUnid == uoCode);
+            if (uoInfo is null) continue;
+
+            var locs = tabelas.Localizacao
+                .Where(l => l.CdOrgao == orgCode && l.CdUnid == uoCode)
+                .ToList();
+
+            var targetAreaCodes = esfera == "A"
+                ? locs.Select(l => l.CdArea).Distinct()
+                : filteredTombamento
+                    .Where(p => p.CdOrgao == orgCode && p.CdUnid == uoCode)
+                    .Select(p => p.CdArea).Distinct();
+
+            var areas = new List<AreaRecord>();
+            foreach (var areaCode in targetAreaCodes)
+            {
+                var areaInfo = tabelas.PaArea.FirstOrDefault(a => a.CdArea == areaCode);
+                if (areaInfo is null) continue;
+
+                var targetSubCodes = esfera == "A"
+                    ? locs.Where(l => l.CdArea == areaCode).Select(l => l.CdSArea).Distinct()
+                    : filteredTombamento
+                        .Where(p => p.CdOrgao == orgCode && p.CdUnid == uoCode && p.CdArea == areaCode)
+                        .Select(p => p.CdSArea).Distinct();
+
+                var subareas = new List<SubareaRecord>();
+                foreach (var subCode in targetSubCodes)
+                {
+                    var subInfo = tabelas.PasArea.FirstOrDefault(s => s.CdSArea == subCode);
+                    if (subInfo is null) continue;
+                    subareas.Add(new SubareaRecord(subCode, subInfo.NmSArea));
+                }
+
+                areas.Add(new AreaRecord(areaCode, areaInfo.NmArea, subareas));
+            }
+
+            uos.Add(new UnidadeOrcamentariaRecord(uoCode, uoInfo.NmUnid, areas));
+        }
+
+        orgaos.Add(new OrgaoRecord(orgCode, orgInfo.NmOrgao, uos));
+    }
+
+    return orgaos;
+}
+
+// ─── DTOs e Records ───────────────────────────────────────────────────────────
 public record PresignedUrlRequest(string FileName, string ContentType, string AssetId, string AssetCode);
 public record PresignedUrlResponse(string Url, string Key);
 public record LoginRequest(string Usuario, string Senha);
-public record AuthResponse(string NomeCompleto, string Prefixo, List<OrgaoRecord> Orgaos, string Token);
-public record UsuarioRecord(string Usuario, string Senha, string NomeCompleto, List<OrgaoRecord> Orgaos);
+
+public record AuthResponse(
+    string NomeCompleto,
+    string Prefixo,
+    string Esfera,
+    List<OrgaoRecord> Orgaos,
+    List<TombamentoItemResponse> Tombamento,
+    string Token
+);
+
+public record TombamentoItemResponse(long IdPatomb, string Nutomb, string Esfera, string Deprod);
+
+public class TombamentoCargaItem
+{
+    [JsonPropertyName("idpatomb")]
+    public long IdPatomb { get; set; }
+    [JsonPropertyName("nutomb")]
+    public string Nutomb { get; set; } = string.Empty;
+    [JsonPropertyName("deprod")]
+    public string Deprod { get; set; } = string.Empty;
+    [JsonPropertyName("esfera")]
+    public string Esfera { get; set; } = string.Empty;
+    [JsonPropertyName("cdorgao")]
+    public string CdOrgao { get; set; } = string.Empty;
+    [JsonPropertyName("cdunid")]
+    public string CdUnid { get; set; } = string.Empty;
+    [JsonPropertyName("cdarea")]
+    public string CdArea { get; set; } = string.Empty;
+    [JsonPropertyName("cdsarea")]
+    public string CdSArea { get; set; } = string.Empty;
+}
+
+// ─── Records para o JSON Unificado ───────────────────────────────────────────
+// CORREÇÃO BUG #1: [JsonPropertyName] garante que a desserialização case-insensitive
+// funcione corretamente com records posicionais em .NET
+
+public record UnifiedDataRecord(
+    [property: JsonPropertyName("cliente")] string Cliente,
+    [property: JsonPropertyName("usuarios")] List<UserRecord> Usuarios,
+    [property: JsonPropertyName("tabelas")] TabelasRecord? Tabelas,
+    [property: JsonPropertyName("tombamento")] List<TombamentoRecord>? Tombamento
+);
+
+// CORREÇÃO BUG #2: NomeCompleto é nullable pois pode não existir no JSON
+public record UserRecord(
+    [property: JsonPropertyName("idusuario")] string IdUsuario,
+    [property: JsonPropertyName("nmusuario")] string NmUsuario,
+    [property: JsonPropertyName("pwdusuario")] string PwdUsuario,
+    [property: JsonPropertyName("esfera")] string Esfera,
+    [property: JsonPropertyName("nomecompleto")] string? NomeCompleto
+);
+
+public record TabelasRecord(
+    [property: JsonPropertyName("xxorga")] List<XxOrgaRecord> XxOrga,
+    [property: JsonPropertyName("xxunid")] List<XxUnidRecord> XxUnid,
+    [property: JsonPropertyName("paarea")] List<PaAreaRecord> PaArea,
+    [property: JsonPropertyName("pasarea")] List<PasAreaRecord> PasArea,
+    [property: JsonPropertyName("localizacao")] List<LocalizacaoRecord> Localizacao
+);
+
+public record XxOrgaRecord(
+    [property: JsonPropertyName("cdorgao")] string CdOrgao,
+    [property: JsonPropertyName("nmorgao")] string NmOrgao
+);
+
+public record XxUnidRecord(
+    [property: JsonPropertyName("cdorgao")] string CdOrgao,
+    [property: JsonPropertyName("cdunid")] string CdUnid,
+    [property: JsonPropertyName("nmunid")] string NmUnid
+);
+
+public record PaAreaRecord(
+    [property: JsonPropertyName("cdarea")] string CdArea,
+    [property: JsonPropertyName("nmarea")] string NmArea
+);
+
+public record PasAreaRecord(
+    [property: JsonPropertyName("cdsarea")] string CdSArea,
+    [property: JsonPropertyName("nmsarea")] string NmSArea
+);
+
+public record LocalizacaoRecord(
+    [property: JsonPropertyName("cdorgao")] string CdOrgao,
+    [property: JsonPropertyName("cdunid")] string CdUnid,
+    [property: JsonPropertyName("cdarea")] string CdArea,
+    [property: JsonPropertyName("cdsarea")] string CdSArea
+);
+
+public record TombamentoRecord(
+    [property: JsonPropertyName("idpatomb")] long IdPatomb,
+    [property: JsonPropertyName("nutomb")] string Nutomb,
+    [property: JsonPropertyName("deprod")] string Deprod,
+    [property: JsonPropertyName("esfera")] string Esfera,
+    [property: JsonPropertyName("cdorgao")] string CdOrgao,
+    [property: JsonPropertyName("cdunid")] string CdUnid,
+    [property: JsonPropertyName("cdarea")] string CdArea,
+    [property: JsonPropertyName("cdsarea")] string CdSArea
+);
+
+// ─── Records de resposta hierárquica ─────────────────────────────────────────
 public record OrgaoRecord(string IdOrgao, string NomeOrgao, List<UnidadeOrcamentariaRecord> UnidadesOrcamentarias);
 public record UnidadeOrcamentariaRecord(string IdUO, string NomeUO, List<AreaRecord> Areas);
 public record AreaRecord(string IdArea, string NomeArea, List<SubareaRecord> Subareas);
 public record SubareaRecord(string IdSubarea, string NomeSubarea);
-
