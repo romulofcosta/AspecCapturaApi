@@ -4,7 +4,13 @@ using Microsoft.AspNetCore.Mvc;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-var builder = WebApplication.CreateBuilder(args);
+var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+{
+    Args = args,
+    // Se a variável de ambiente não estiver definida, assume "Development"
+    // Isso garante que appsettings.Development.json seja carregado corretamente
+    EnvironmentName = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "Development"
+});
 
 // ─── Logging Estruturado ───────────────────────────────────────────────────────
 builder.Logging.ClearProviders();
@@ -52,11 +58,28 @@ var jsonOptions = new JsonSerializerOptions
 {
     PropertyNameCaseInsensitive = true,
     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    AllowTrailingCommas = true,
+    ReadCommentHandling = JsonCommentHandling.Skip
 };
+
+builder.Services.AddResponseCompression(options =>
+{
+    options.EnableForHttps = true;
+});
+
+builder.Services.AddControllers()
+    .AddJsonOptions(options =>
+    {
+        options.JsonSerializerOptions.MaxDepth = 0; // sem limite de profundidade
+        options.JsonSerializerOptions.DefaultBufferSize = 16 * 1024 * 1024; // 16 MB, ajuste conforme necessário
+    });
+
 
 var app = builder.Build();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
+
+app.UseResponseCompression();
 
 // ─── Pipeline ─────────────────────────────────────────────────────────────────
 if (app.Environment.IsDevelopment())
@@ -311,34 +334,41 @@ app.MapPost("/api/auth/login", async (
         //     log.LogWarning(ex, "Falha ao carregar patrimônio completo do arquivo {PatrimonioKey}", patrimonioKey);
         // }
 
-        // 3. Filtra patrimônio para a esfera do usuário
-        // var patrimonioFiltrado = user.Esfera == "A"
-        //     ? patrimonioCarga
-        //     : patrimonioCarga.Where(p => p.Esfera == user.Esfera).ToList();
-
-        var tombamentoBase = root.Tombamento ?? new List<TombamentoRecord>();
-        var tombamentoFiltrado = user.Esfera == "A"
-            ? tombamentoBase
-            : tombamentoBase.Where(p => p.Esfera == user.Esfera).ToList();
-
-        // 4. Filtra patrimônio para árvore de órgãos (dados de apoio)
+        // 3. Obtém dados das tabelas
         var tabelas = root.Tabelas;
         if (tabelas is null)
         {
             log.LogWarning("Seção 'tabelas' ausente no arquivo {S3Key}.", s3Key);
             return Results.Problem("Dados de tabelas ausentes no arquivo do município.");
         }
-        var orgaos = BuildOrgaoHierarchy(user.Esfera, tombamentoFiltrado.ToList(), tabelas);
 
-        // 5. Monta resposta
-        return Results.Ok(new AuthResponse(
-            NomeCompleto: user.NomeCompleto ?? user.NmUsuario,
-            Prefixo: prefix,
-            Esfera: user.Esfera,
-            Orgaos: orgaos,
-                Tombamento: tombamentoFiltrado.Select(p => new TombamentoItemResponse(p.IdPatomb, p.Nutomb, p.Esfera, p.Deprod)).ToList(),
-            Token: Guid.NewGuid().ToString()
-        ));
+        // 4. Filtra patrimônio para a esfera do usuário
+        var tombamentoBase = tabelas.Tombamentos ?? new List<TombamentoRecord>();
+        
+        log.LogInformation("Tombamentos encontrados em tabelas.tombamentos: {Count}", tombamentoBase.Count);
+
+        var tombamentoFiltrado = user.Esfera == "A"
+            ? tombamentoBase
+            : tombamentoBase.Where(p => p.Esfera == user.Esfera).ToList();
+
+        log.LogInformation("Tombamentos filtrados para esfera {Esfera}: {Count}", user.Esfera, tombamentoFiltrado.Count);
+
+        // 5. Filtra patrimônio para árvore de órgãos (dados de apoio)
+        var orgaos = BuildOrgaoHierarchy(user.Esfera, tombamentoFiltrado, tabelas);
+
+        var tombamentos = tombamentoFiltrado.Select(p => new TombamentoItemResponse(p.IdPatomb, p.Nutomb, p.Esfera, p.Deprod)).AsQueryable();
+
+        return Results.Stream(async stream =>
+        {
+            await JsonSerializer.SerializeAsync(stream, new AuthResponse(
+                NomeCompleto: user.NomeCompleto ?? user.NmUsuario,
+                Prefixo: prefix,
+                Esfera: user.Esfera,
+                Orgaos: orgaos,
+                Tombamentos: tombamentos.ToList(),
+                Token: Guid.NewGuid().ToString()
+            ));
+        });
     }
     catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
     {
@@ -441,7 +471,7 @@ public record AuthResponse(
     string Prefixo,
     string Esfera,
     List<OrgaoRecord> Orgaos,
-    List<TombamentoItemResponse> Tombamento,
+    List<TombamentoItemResponse> Tombamentos,
     string Token
 );
 
@@ -472,10 +502,9 @@ public class TombamentoCargaItem
 // funcione corretamente com records posicionais em .NET
 
 public record UnifiedDataRecord(
-    [property: JsonPropertyName("cliente")] string Cliente,
-    [property: JsonPropertyName("usuarios")] List<UserRecord> Usuarios,
-    [property: JsonPropertyName("tabelas")] TabelasRecord? Tabelas,
-    [property: JsonPropertyName("tombamento")] List<TombamentoRecord>? Tombamento
+    [property: JsonPropertyName("cliente")] string? Cliente,
+    [property: JsonPropertyName("usuarios")] List<UserRecord>? Usuarios,
+    [property: JsonPropertyName("tabelas")] TabelasRecord? Tabelas
 );
 
 // CORREÇÃO BUG #2: NomeCompleto é nullable pois pode não existir no JSON
@@ -492,7 +521,8 @@ public record TabelasRecord(
     [property: JsonPropertyName("xxunid")] List<XxUnidRecord> XxUnid,
     [property: JsonPropertyName("paarea")] List<PaAreaRecord> PaArea,
     [property: JsonPropertyName("pasarea")] List<PasAreaRecord> PasArea,
-    [property: JsonPropertyName("localizacao")] List<LocalizacaoRecord> Localizacao
+    [property: JsonPropertyName("localizacao")] List<LocalizacaoRecord> Localizacao,
+    [property: JsonPropertyName("tombamentos")] List<TombamentoRecord> Tombamentos
 );
 
 public record XxOrgaRecord(

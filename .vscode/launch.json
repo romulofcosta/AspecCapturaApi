@@ -1,0 +1,32 @@
+{
+
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "API Debug",
+            "type": "coreclr",
+            "request": "launch",
+            "preLaunchTask": "build-api",
+            "program": "${workspaceFolder}/bin/Debug/net8.0/pwa-camera-poc-api.dll",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false,
+            "launchBrowser": true,
+            "serverReadyAction": {
+                "action": "openExternally",
+                "pattern": "\\bNow listening on:\\s+(https?://\\S+)",
+                "uriFormat": "%s/swagger"
+            },
+            "env": {
+                "ASPNETCORE_ENVIRONMENT": "Development",
+                "ASPNETCORE_URLS": "http://localhost:5069"
+            }
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Debug Blazor + API",
+            "configurations": ["API Debug", "Blazor Debug"]
+        }
+    ]
+}
