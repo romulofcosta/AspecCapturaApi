@@ -28,3 +28,10 @@ Para rodar a API localmente, certifique-se de configurar as seguintes variáveis
 - `POST /api/auth/login`: Autenticação via Broker S3.
 - `POST /api/storage/presigned-url`: Geração de URLs para upload direto ao S3.
 - `GET /api/storage/exists/{path}`: Verificação de existência de arquivos no S3.
+
+## Atualizações Recentes
+
+- Respostas de login enviadas via streaming, reduzindo uso de memória em grandes volumes.
+- Compressão de resposta habilitada para HTTPS.
+- Desserialização mais tolerante (vírgulas finais e comentários no JSON).
+- Auto-configuração de CORS do bucket S3 no startup.

@@ -26,29 +26,18 @@ builder.Services.AddCors(options =>
 ```csharp
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("AllowSpecificOrigins",
-        corsBuilder =>
-        {
-            // Production origin (Cloudflare Pages deployment)
-            var allowedOrigins = new List<string>
+    options.AddPolicy("AllowSpecificOrigins", corsBuilder =>
+    {
+        corsBuilder
+            .SetIsOriginAllowed(origin =>
             {
-                "https://pwa-camera-poc-blazor.pages.dev"
-            };
-
-            // Add localhost origins for development
-            if (builder.Environment.IsDevelopment())
-            {
-                allowedOrigins.Add("https://localhost:5001");
-                allowedOrigins.Add("http://localhost:5000");
-                allowedOrigins.Add("https://localhost:7001");
-                allowedOrigins.Add("http://localhost:7000");
-            }
-
-            corsBuilder.WithOrigins(allowedOrigins.ToArray())
-                       .AllowAnyMethod()
-                       .AllowAnyHeader()
-                       .AllowCredentials();
-        });
+                if (builder.Environment.IsDevelopment()) return true;
+                return origin.EndsWith(".pwa-camera-poc-blazor.pages.dev");
+            })
+            .AllowAnyMethod()
+            .AllowAnyHeader()
+            .AllowCredentials();
+    });
 });
 ```
 
@@ -58,10 +47,7 @@ builder.Services.AddCors(options =>
 - `https://pwa-camera-poc-blazor.pages.dev` - Frontend Blazor hospedado no Cloudflare Pages
 
 ### Desenvolvimento (apenas quando `ASPNETCORE_ENVIRONMENT=Development`)
-- `https://localhost:5001`
-- `http://localhost:5000`
-- `https://localhost:7001`
-- `http://localhost:7000`
+- Todas as origens são permitidas para facilitar desenvolvimento local.
 
 ## 🔧 Configuração do Frontend
 
@@ -96,14 +82,10 @@ Se você precisar adicionar uma nova origem permitida (por exemplo, um novo dom�
 
 1. Abra `pwa-camera-poc-api/Program.cs`
 2. Localize a seção de configuração de CORS
-3. Adicione a nova origem à lista `allowedOrigins`:
+3. Ajuste a lógica de `SetIsOriginAllowed` para atender seu domínio. Exemplo:
 
 ```csharp
-var allowedOrigins = new List<string>
-{
-    "https://pwa-camera-poc-blazor.pages.dev",
-    "https://seu-novo-dominio.com"  // Nova origem
-};
+return origin.EndsWith(".seu-dominio.com") || origin == "https://app.seu-dominio.com";
 ```
 
 ## 🔐 Recursos de Segurança

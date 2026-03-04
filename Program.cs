@@ -1,6 +1,12 @@
 using Amazon.S3;
 using Amazon.S3.Model;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.ResponseCompression;
+using Microsoft.Extensions.Caching.Memory;
+using System.Buffers;
+using System.IO.Compression;
+using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -66,7 +72,10 @@ var jsonOptions = new JsonSerializerOptions
 builder.Services.AddResponseCompression(options =>
 {
     options.EnableForHttps = true;
+    options.Providers.Add<BrotliCompressionProvider>();
 });
+builder.Services.Configure<BrotliCompressionProviderOptions>(o => o.Level = CompressionLevel.Fastest);
+builder.Services.AddMemoryCache();
 
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
@@ -264,6 +273,7 @@ app.MapGet("/api/storage/exists/{*filePath}", async (
 .WithOpenApi()
 .WithTags("Storage");
 
+
 // ─── ENDPOINT: Login ──────────────────────────────────────────────────────────
 app.MapPost("/api/auth/login", async (
     [FromBody] LoginRequest request,
@@ -368,7 +378,7 @@ app.MapPost("/api/auth/login", async (
                 Tombamentos: tombamentos.ToList(),
                 Token: Guid.NewGuid().ToString()
             ));
-        });
+        }, "application/json");
     }
     catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
     {
@@ -389,6 +399,133 @@ app.MapPost("/api/auth/login", async (
 .WithName("Login")
 .WithOpenApi()
 .WithTags("Auth");
+
+app.MapGet("/api/tombamentos/sync-info", async (
+    [FromQuery] string prefix,
+    [FromServices] IAmazonS3 s3,
+    [FromServices] IConfiguration config,
+    [FromServices] IMemoryCache cache,
+    ILogger<Program> log) =>
+{
+    try
+    {
+        if (string.IsNullOrWhiteSpace(prefix))
+        {
+            log.LogWarning("SyncInfo: prefix vazio ou nulo");
+            return Results.BadRequest(new { error = "prefix é obrigatório" });
+        }
+        
+        var bucket = config["AWS:BucketName"];
+        if (string.IsNullOrEmpty(bucket))
+        {
+            log.LogError("SyncInfo: Bucket não configurado");
+            return Results.Problem("Bucket não configurado.");
+        }
+        
+        var key = $"usuarios/{prefix.ToUpper()}.json";
+        log.LogInformation("SyncInfo: Processando key={Key}", key);
+        
+        // Verifica se o arquivo existe antes de processar
+        try
+        {
+            await s3.GetObjectMetadataAsync(bucket, key);
+        }
+        catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            log.LogWarning("SyncInfo: Arquivo não encontrado: {Key}", key);
+            return Results.NotFound(new { error = $"Arquivo {key} não encontrado no bucket {bucket}" });
+        }
+        
+        var index = await BuildOrGetChunkIndexAsync(s3, bucket, key, cache);
+        
+        log.LogInformation("SyncInfo: Sucesso - {TotalRegistros} registros, {TotalChunks} chunks", 
+            index.TotalRecords, index.Chunks.Count);
+        
+        return Results.Ok(new
+        {
+            totalRegistros = index.TotalRecords,
+            totalChunks = index.Chunks.Count,
+            versao = index.Version,
+            hashGlobal = index.GlobalHash
+        });
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "SyncInfo: Erro ao processar sync-info para prefix={Prefix}", prefix);
+        return Results.Problem(
+            title: "Erro ao processar sync-info",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+})
+.WithName("TombamentosSyncInfo")
+.WithOpenApi()
+.WithTags("Tombamentos");
+
+app.MapGet("/api/tombamentos/lote/{id:int}", async (
+    int id,
+    [FromQuery] string prefix,
+    [FromServices] IAmazonS3 s3,
+    [FromServices] IConfiguration config,
+    [FromServices] IMemoryCache cache,
+    ILogger<Program> log) =>
+{
+    try
+    {
+        if (string.IsNullOrWhiteSpace(prefix))
+        {
+            log.LogWarning("Lote: prefix vazio ou nulo");
+            return Results.BadRequest(new { error = "prefix é obrigatório" });
+        }
+        
+        var bucket = config["AWS:BucketName"];
+        if (string.IsNullOrEmpty(bucket))
+        {
+            log.LogError("Lote: Bucket não configurado");
+            return Results.Problem("Bucket não configurado.");
+        }
+        
+        var key = $"usuarios/{prefix.ToUpper()}.json";
+        log.LogInformation("Lote: Processando chunk {ChunkId} para key={Key}", id, key);
+        
+        var index = await BuildOrGetChunkIndexAsync(s3, bucket, key, cache);
+        
+        if (id < 1 || id > index.Chunks.Count)
+        {
+            log.LogWarning("Lote: ChunkId {ChunkId} inválido (total: {Total})", id, index.Chunks.Count);
+            return Results.NotFound(new { error = $"chunkId {id} inválido (total: {index.Chunks.Count})" });
+        }
+        
+        var chunkMeta = index.Chunks[id - 1];
+        var cacheKey = $"TOMB-CHUNK:{bucket}:{key}:{index.Version}:{id}";
+        
+        if (!cache.TryGetValue<byte[]>(cacheKey, out var payload))
+        {
+            log.LogInformation("Lote: Gerando payload para chunk {ChunkId}", id);
+            payload = await SerializeChunkPayloadAsync(s3, bucket, key, chunkMeta, index.Options);
+            cache.Set(cacheKey, payload, TimeSpan.FromHours(1));
+        }
+        else
+        {
+            log.LogInformation("Lote: Usando payload em cache para chunk {ChunkId}", id);
+        }
+        
+        return Results.Bytes(payload!, "application/json");
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "Lote: Erro ao processar chunk {ChunkId} para prefix={Prefix}", id, prefix);
+        return Results.Problem(
+            title: "Erro ao processar lote",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+})
+.WithName("TombamentosChunk")
+.WithOpenApi()
+.WithTags("Tombamentos");
 
 app.Run();
 
@@ -459,6 +596,204 @@ static List<OrgaoRecord> BuildOrgaoHierarchy(
     }
 
     return orgaos;
+}
+
+static async Task<ChunkIndex> BuildOrGetChunkIndexAsync(IAmazonS3 s3, string bucket, string key, IMemoryCache cache)
+{
+    var head = await s3.GetObjectMetadataAsync(bucket, key);
+    var dt = head.LastModified ?? DateTime.UtcNow;
+    var version = dt.ToUniversalTime().ToString("yyyyMMddHHmmss");
+    var cacheKey = $"TOMB-INDEX:{bucket}:{key}:{version}";
+    if (cache.TryGetValue<ChunkIndex>(cacheKey, out var cached) && cached is not null) 
+        return cached;
+    
+    var options = new JsonSerializerOptions
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+    var chunks = new List<ChunkMeta>();
+    var sha256 = SHA256.Create();
+    var globalHashCtx = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+    var total = 0;
+    var current = new List<TombamentoRecord>();
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ESTRATEGIA 1: BATCHING FIXO (RECOMENDADA)
+    // Performance: O(n) - ~10-20 segundos para 42 MB
+    // ═══════════════════════════════════════════════════════════════════════════
+    const int MaxItemsPerChunk = 5000; // Ajuste conforme necessario (5k-10k recomendado)
+    
+    using var obj = await s3.GetObjectAsync(bucket, key);
+    using var stream = obj.ResponseStream;
+    
+    // ⚠️ CORRECAO: Usar await ao inves de .Result e validar null
+    var unifiedData = await JsonSerializer.DeserializeAsync<UnifiedDataRecord>(stream, options);
+    var itens = unifiedData?.Tabelas?.Tombamentos?.ToList();
+    
+    // Validacao critica: se itens for null, retorna index vazio
+    if (itens is null || itens.Count == 0)
+    {
+        Console.WriteLine($"[AVISO] Nenhum tombamento encontrado em {key}");
+        var emptyIndex = new ChunkIndex(version, 0, "", new List<ChunkMeta>(), options);
+        cache.Set(cacheKey, emptyIndex, TimeSpan.FromHours(1));
+        return emptyIndex;
+    }
+
+    Console.WriteLine($"[INFO] Processando {itens.Count} tombamentos de {key}");
+
+    foreach (var item in itens)
+    {
+        if (item is null) continue;
+        current.Add(item);
+        total++;
+        
+        // Verifica apenas o tamanho do buffer, nao serializa/comprime a cada item
+        if (current.Count >= MaxItemsPerChunk)
+        {
+            await FinalizeChunkAsync(current, total, sha256, globalHashCtx, chunks, options);
+            current.Clear();
+        }
+    }
+    
+    // Processa o ultimo chunk (se houver registros restantes)
+    if (current.Count > 0)
+    {
+        await FinalizeChunkAsync(current, total, sha256, globalHashCtx, chunks, options);
+    }
+    
+    var globalHash = Convert.ToHexString(globalHashCtx.GetHashAndReset());
+    var index = new ChunkIndex(version, total, globalHash, chunks, options);
+    cache.Set(cacheKey, index, TimeSpan.FromHours(1));
+    return index;
+}
+
+// ─── METODO AUXILIAR: FINALIZA CHUNK ─────────────────────────────────────────
+static async Task FinalizeChunkAsync(
+    List<TombamentoRecord> buffer, 
+    int totalProcessed, 
+    SHA256 sha256, 
+    IncrementalHash globalHashCtx, 
+    List<ChunkMeta> chunks, 
+    JsonSerializerOptions options)
+{
+    // Serializa apenas uma vez quando o chunk esta completo
+    var jsonBytes = JsonSerializer.SerializeToUtf8Bytes(buffer, options);
+    var hash = Convert.ToHexString(sha256.ComputeHash(jsonBytes));
+    globalHashCtx.AppendData(Convert.FromHexString(hash));
+    chunks.Add(new ChunkMeta(totalProcessed - buffer.Count + 1, buffer.Count, hash));
+    
+    // Log opcional para monitoramento
+    Console.WriteLine($"[CHUNK] Finalizado: {buffer.Count} registros, {jsonBytes.Length / 1024} KB");
+    await Task.CompletedTask; // Placeholder para operacoes async futuras
+}
+
+// ─── ESTRATEGIA 2: ESTIMATIVA DE TAMANHO (ALTERNATIVA) ───────────────────────
+// Descomente para usar estimativa ao inves de batching fixo
+/*
+static int EstimateChunkSize(List<TombamentoRecord> sampleBuffer, int targetCompressedBytes, JsonSerializerOptions options)
+{
+    // Amostra os primeiros 100 registros para estimar tamanho medio
+    const int SampleSize = 100;
+    if (sampleBuffer.Count < SampleSize) return 5000; // Fallback
+    
+    var sample = sampleBuffer.Take(SampleSize).ToList();
+    var sampleJson = JsonSerializer.SerializeToUtf8Bytes(sample, options);
+    
+    using var ms = new MemoryStream();
+    using (var brotli = new BrotliStream(ms, CompressionLevel.Fastest))
+    {
+        brotli.Write(sampleJson);
+    }
+    
+    var avgCompressedBytesPerRecord = ms.Length / SampleSize;
+    var estimatedChunkSize = (int)(targetCompressedBytes / avgCompressedBytesPerRecord * 0.9); // 90% margem
+    
+    return Math.Max(1000, Math.Min(estimatedChunkSize, 10000)); // Entre 1k-10k
+}
+*/
+
+// ─── ESTRATEGIA 3: ESCRITA INCREMENTAL (AVANCADA) ────────────────────────────
+// Descomente para usar escrita incremental com Utf8JsonWriter
+/*
+static async Task<bool> ExceedsTargetIncrementalAsync(
+    List<TombamentoRecord> buffer, 
+    int targetCompressedBytes, 
+    JsonSerializerOptions options)
+{
+    await using var ms = new MemoryStream();
+    await using var brotli = new BrotliStream(ms, CompressionLevel.Fastest, leaveOpen: true);
+    await using var writer = new Utf8JsonWriter(brotli, new JsonWriterOptions { Indented = false });
+    
+    writer.WriteStartArray();
+    foreach (var record in buffer)
+    {
+        JsonSerializer.Serialize(writer, record, options);
+    }
+    writer.WriteEndArray();
+    await writer.FlushAsync();
+    await brotli.FlushAsync();
+    
+    return ms.Length >= targetCompressedBytes && buffer.Count > 0;
+}
+*/
+
+// ─── METODO LEGADO (DEPRECATED) ──────────────────────────────────────────────
+// AVISO: Este metodo causa O(n²) - NAO USAR EM PRODUCAO
+// Mantido apenas como referencia historica do problema de performance
+/*
+static async Task<bool> ExceedsTargetAsync(List<TombamentoRecord> buffer, int targetCompressedBytes, JsonSerializerOptions options)
+{
+    // ⚠️ DEPRECATED: Causa gargalo de performance (14 min para 42 MB)
+    // Use FinalizeChunkAsync com batching fixo ao inves deste metodo
+    var jsonBytes = JsonSerializer.SerializeToUtf8Bytes(buffer, options);
+    await using var ms = new MemoryStream();
+    await using (var brotli = new BrotliStream(ms, CompressionLevel.Fastest, leaveOpen: true))
+    {
+        await brotli.WriteAsync(jsonBytes);
+    }
+    return ms.Length >= targetCompressedBytes && buffer.Count > 0;
+}
+*/
+
+static async Task<byte[]> SerializeChunkPayloadAsync(IAmazonS3 s3, string bucket, string key, ChunkMeta meta, JsonSerializerOptions options)
+{
+    var result = new
+    {
+        chunkId = (int)((meta.Start - 1) / meta.Count) + 1,
+        data = new List<TombamentoRecord>(meta.Count),
+        hash = meta.Hash
+    };
+    
+    using var obj = await s3.GetObjectAsync(bucket, key);
+    using var stream = obj.ResponseStream;
+    
+    // ⚠️ CORRECAO: Usar UnifiedDataRecord ao inves de DeserializeAsyncEnumerable
+    var unifiedData = await JsonSerializer.DeserializeAsync<UnifiedDataRecord>(stream, options);
+    var allItems = unifiedData?.Tabelas?.Tombamentos?.ToList();
+    
+    if (allItems is null || allItems.Count == 0)
+    {
+        Console.WriteLine($"[AVISO] SerializeChunkPayload: Nenhum tombamento encontrado em {key}");
+        return JsonSerializer.SerializeToUtf8Bytes(result, options);
+    }
+    
+    var start = meta.Start;
+    var end = meta.Start + meta.Count - 1;
+    
+    // Extrai apenas os itens do chunk especificado
+    for (int i = start - 1; i < end && i < allItems.Count; i++)
+    {
+        var item = allItems[i];
+        if (item is not null)
+        {
+            result.data.Add(item);
+        }
+    }
+    
+    Console.WriteLine($"[INFO] SerializeChunkPayload: Chunk {result.chunkId} com {result.data.Count} registros");
+    
+    return JsonSerializer.SerializeToUtf8Bytes(result, options);
 }
 
 // ─── DTOs e Records ───────────────────────────────────────────────────────────
@@ -569,3 +904,6 @@ public record OrgaoRecord(string IdOrgao, string NomeOrgao, List<UnidadeOrcament
 public record UnidadeOrcamentariaRecord(string IdUO, string NomeUO, List<AreaRecord> Areas);
 public record AreaRecord(string IdArea, string NomeArea, List<SubareaRecord> Subareas);
 public record SubareaRecord(string IdSubarea, string NomeSubarea);
+
+record ChunkMeta(int Start, int Count, string Hash);
+record ChunkIndex(string Version, int TotalRecords, string GlobalHash, List<ChunkMeta> Chunks, JsonSerializerOptions Options);

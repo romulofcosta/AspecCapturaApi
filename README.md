@@ -1,6 +1,9 @@
 # pwa-camera-poc-api
 
-API Backend (Minimal API .NET 10) projetada para dar suporte ao PWA de Inventário Patrimonial. Sua função principal é intermediar operações sensíveis ou incompatíveis com o ambiente WebAssembly (Blazor WASM), especificamente a geração de URLs assinadas para upload seguro no Amazon S3.
+API Backend (Minimal API .NET 8) que dá suporte ao PWA de Inventário Patrimonial. Atua como BFF (Backend for Frontend) para:
+- Autenticação de usuários via arquivos JSON no S3 (Authentication Broker).
+- Geração de Pre-Signed URLs para upload direto ao S3.
+- Resposta de login com dados hierárquicos de tombamentos de forma eficiente (streaming + compressão).
 
 ##  Arquitetura
 
@@ -13,11 +16,12 @@ Esta API atua como um **BFF (Backend for Frontend)** leve:
 2. Esta API (rodando no servidor) usa as credenciais da AWS para gerar uma **Pre-Signed URL** válida por 15 minutos.
 3. A API retorna a URL e a Key (caminho) para o Front-end.
 4. O Front-end faz o upload do arquivo diretamente para o S3 usando a URL assinada, sem trafegar o binário pela API.
+5. No login, a API lê o arquivo `usuarios/{PREFIXO}.json` do S3, valida o usuário e retorna a hierarquia de órgãos/UOs/áreas/subáreas e tombamentos por esfera.
 
 ##  Como Rodar
 
 ### Pré-requisitos
-- .NET 10 SDK instalado.
+- .NET 8 SDK instalado.
 - Acesso a uma conta AWS com permissões de S3 (`PutObject`).
 
 ### Configuração
@@ -50,9 +54,12 @@ dotnet run
 
 A API estará disponível em:
 - Swagger UI: http://localhost:5069/swagger
-- Endpoint: http://localhost:5069/api/storage/presigned-url
+- Exemplos de endpoints: 
+  - POST http://localhost:5069/api/auth/login
+  - POST http://localhost:5069/api/storage/presigned-url
+  - GET  http://localhost:5069/api/storage/exists/{path}
 
-## � Documentação da API
+##  Documentação da API
 
 ### `POST /api/storage/presigned-url`
 
@@ -89,6 +96,18 @@ curl -X POST "http://localhost:5069/api/storage/presigned-url" \
 }
 ```
 
+### `GET /api/storage/exists/{path}`
+- Verifica se um objeto existe no S3 e retorna sua URL pública (se aplicável).
+
+### `POST /api/auth/login`
+- Autentica um usuário provisionado em `usuarios/{PREFIX}.json` no S3, com username no formato `prefix.usuario`.
+- Retorna:
+  - Nome completo
+  - Prefixo e esfera
+  - Hierarquia de órgãos/UOs/áreas/subáreas filtrada pela esfera
+  - Lista de tombamentos da esfera (streaming + compressão)
+  - Token de sessão (placeholder)
+
 ##  Desenvolvimento
 
 ### Dependências Principais
@@ -99,3 +118,12 @@ curl -X POST "http://localhost:5069/api/storage/presigned-url" \
 ### Estrutura de Pastas
 - `Program.cs`: Contém toda a lógica da Minimal API (Configuração, DI, Rotas).
 - `docs/`: Documentação do projeto (Changelog, Guias).
+
+### Melhorias Recentes
+- Serialização JSON mais tolerante: aceita vírgulas finais e ignora comentários.
+- Resposta do login por streaming (menor uso de memória).
+- Compressão de resposta habilitada (HTTPS).
+- Auto-configuração de CORS do bucket S3 durante o startup.
+- Opções JSON dos Controllers ajustadas (profundidade ilimitada e buffer ampliado).
+
+> Segurança: nunca versione chaves reais no repositório. Use variáveis de ambiente em produção.
