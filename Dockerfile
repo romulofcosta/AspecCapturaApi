@@ -1,30 +1,50 @@
-# See https://aka.ms/customizecontainer to learn how to customize your debug container and how Visual Studio uses this Dockerfile to build your images for faster debugging.
+# ============================================
+# Stage 1: Build
+# ============================================
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
 
-# This stage is used when running from VS in fast mode (Default for Debug configuration)
-FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
-USER app
+# Copiar arquivo de projeto e restaurar dependências
+COPY ["pwa-camera-poc-api.csproj", "./"]
+RUN dotnet restore "pwa-camera-poc-api.csproj"
+
+# Copiar todo o código fonte e compilar
+COPY . .
+RUN dotnet build "pwa-camera-poc-api.csproj" -c Release -o /app/build
+
+# ============================================
+# Stage 2: Publish
+# ============================================
+FROM build AS publish
+RUN dotnet publish "pwa-camera-poc-api.csproj" -c Release -o /app/publish /p:UseAppHost=false
+
+# ============================================
+# Stage 3: Runtime
+# ============================================
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final
 WORKDIR /app
+
+# Criar usuário não-root para segurança
+RUN addgroup --system --gid 1001 appuser && \
+    adduser --system --uid 1001 --ingroup appuser appuser
+
+# Copiar arquivos publicados do stage anterior
+COPY --from=publish /app/publish .
+
+# Configurar permissões
+RUN chown -R appuser:appuser /app
+
+# Mudar para usuário não-root
+USER appuser
+
+# Expor porta (Render usa a variável de ambiente PORT)
 EXPOSE 8080
 
+# Configurar variáveis de ambiente
+ENV ASPNETCORE_URLS=http://+:8080 \
+    ASPNETCORE_ENVIRONMENT=Production \
+    DOTNET_RUNNING_IN_CONTAINER=true \
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
 
-# This stage is used to build the service project
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
-ARG BUILD_CONFIGURATION=Release
-WORKDIR /src
-COPY ["pwa-camera-poc-api.csproj", "."]
-RUN dotnet restore "./pwa-camera-poc-api.csproj"
-COPY . .
-WORKDIR "/src/."
-RUN dotnet build "./pwa-camera-poc-api.csproj" -c $BUILD_CONFIGURATION -o /app/build
-
-# This stage is used to publish the service project to be copied to the final stage
-FROM build AS publish
-ARG BUILD_CONFIGURATION=Release
-RUN dotnet publish "./pwa-camera-poc-api.csproj" -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false
-
-# This stage is used in production or when running from VS in regular mode (Default when not using the Debug configuration)
-FROM base AS final
-WORKDIR /app
-COPY --from=publish /app/publish .
-ENV ASPNETCORE_HTTP_PORTS=8080
+# Entrypoint
 ENTRYPOINT ["dotnet", "pwa-camera-poc-api.dll"]

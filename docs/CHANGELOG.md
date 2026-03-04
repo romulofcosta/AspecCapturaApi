@@ -1,5 +1,32 @@
 # Registro de alterações
 
+## [0.3.2] - 2026-03-04
+
+### 🐛 Correções
+- **Health Check Endpoint**: Adicionado endpoint `/health` para monitoramento do Render
+  - Retorna status e timestamp em formato JSON
+  - Configurado para health checks automáticos do Render
+
+### 🔧 Infraestrutura
+- **Dockerfile Multi-Stage**: Implementado build otimizado para deploy no Render
+  - Stage 1 (Build): SDK .NET 8.0 para compilação
+  - Stage 2 (Publish): Publicação da aplicação
+  - Stage 3 (Runtime): Runtime .NET 8.0 ASP.NET Core
+  - Usuário não-root (appuser) para segurança
+  - Porta 8080 exposta (compatível com Render)
+- **Docker Ignore**: Otimização do contexto de build
+  - Ignora bin/, obj/, .vs/, node_modules/, etc.
+  - Reduz tamanho do contexto e acelera builds
+- **Render Configuration**: Arquivo `render.yaml` para deploy automatizado
+  - Runtime docker configurado
+  - Branch desenvolvimento_v3
+  - Health check em `/health`
+  - Variáveis de ambiente AWS configuráveis
+
+### 📚 Documentação
+- Documentado processo de deploy no Render com .NET 8
+- Instruções de configuração de variáveis de ambiente AWS
+
 ## [0.3.1] - 2026-03-04
 
 ### Documentação

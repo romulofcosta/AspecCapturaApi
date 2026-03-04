@@ -124,6 +124,13 @@ app.UseCors("AllowSpecificOrigins");
 // Redirect root to Swagger UI
 app.MapGet("/", () => Results.Redirect("/swagger"));
 
+// ─── ENDPOINT: Health Check (Render) ─────────────────────────────────────────
+app.MapGet("/health", () => Results.Ok(new { status = "healthy", timestamp = DateTime.UtcNow }))
+    .WithName("HealthCheck")
+    .WithOpenApi()
+    .WithTags("Health")
+    .ExcludeFromDescription();
+
 // ─── Auto-configure S3 CORS (startup) ────────────────────────────────────────
 try
 {

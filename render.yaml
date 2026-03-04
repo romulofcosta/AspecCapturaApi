@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: pwa-camera-poc-api
+    runtime: docker
+    plan: free
+    region: oregon
+    branch: desenvolvimento_v3
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production
+      - key: ASPNETCORE_URLS
+        value: http://+:8080
+      - key: AWS__Region
+        sync: false
+      - key: AWS__BucketName
+        sync: false
+      - key: AWS__AccessKey
+        sync: false
+      - key: AWS__SecretKey
+        sync: false
+    healthCheckPath: /health
+    autoDeploy: true

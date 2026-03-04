@@ -1,7 +1,49 @@
-**/.dockerignore
-**/.env
-**/obj/
+# Diretórios de build
 **/bin/
-**/.git/
-**/.vscode/
-**/Dockerfile
+**/obj/
+**/out/
+
+# Visual Studio
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Arquivos de teste
+**/TestResults/
+
+# Arquivos de configuração local
+appsettings.Development.json
+*.Development.json
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentação
+*.md
+docs/
+
+# Logs
+*.log
+logs/
+
+# Arquivos temporários
+*.tmp
+*.temp
+*~
+
+# Node modules (se houver)
+node_modules/
+
+# Arquivos do sistema
+.DS_Store
+Thumbs.db
+
+# Arquivos de backup
+*.bak
+*.swp
+*.swo
