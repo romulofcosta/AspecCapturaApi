@@ -3,6 +3,7 @@ using Amazon.S3.Model;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.ResponseCompression;
 using Microsoft.Extensions.Caching.Memory;
+using PwaCameraPocApi.Models;
 using System.Buffers;
 using System.IO.Compression;
 using System.Runtime.CompilerServices;
@@ -534,6 +535,403 @@ app.MapGet("/api/tombamentos/lote/{id:int}", async (
 .WithOpenApi()
 .WithTags("Tombamentos");
 
+// ─── ENDPOINT: POST /api/capture/item ────────────────────────────────────────
+app.MapPost("/api/capture/item", async (
+    [FromBody] CaptureItemRequest request,
+    [FromServices] IAmazonS3 s3,
+    [FromServices] IConfiguration config,
+    [FromServices] IMemoryCache cache,
+    ILogger<Program> log) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Prefixo))
+        return Results.BadRequest(new { error = "prefixo é obrigatório." });
+
+    var bucket = config["AWS:BucketName"];
+    if (string.IsNullOrEmpty(bucket))
+        return Results.Problem("Bucket não configurado.");
+
+    var s3Key = $"usuarios/{request.Prefixo.ToUpper()}.json";
+    var writeOptions = new JsonSerializerOptions
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
+    try
+    {
+        // 1. Carregar arquivo completo
+        UnifiedDataRecord root;
+        using (var obj = await s3.GetObjectAsync(bucket, s3Key))
+        using (var stream = obj.ResponseStream)
+        {
+            root = await JsonSerializer.DeserializeAsync<UnifiedDataRecord>(stream, writeOptions)
+                   ?? throw new InvalidOperationException("Arquivo inválido.");
+        }
+
+        var tombamentos = root.Tabelas?.Tombamentos
+            ?? throw new InvalidOperationException("Seção tombamentos ausente.");
+
+        // 2. Localizar tombamento por idpatomb (fallback: nutomb)
+        var existing = tombamentos.FirstOrDefault(t => t.IdPatomb == request.IdPatomb)
+                    ?? tombamentos.FirstOrDefault(t => t.Nutomb == request.Nutomb);
+
+        var today = int.Parse(DateTime.UtcNow.ToString("yyyyMMdd"));
+        string operationStatus;
+
+        if (existing is not null)
+        {
+            // 3a. Atualizar campos de captura
+            existing.Estado = request.Estado ?? existing.Estado;
+            existing.Dataestado = today;
+            existing.Situacao = request.Situacao ?? existing.Situacao;
+            existing.Datasituacao = today;
+            existing.IdLocalizacao = request.IdLocalizacao ?? existing.IdLocalizacao;
+            existing.FotoKey = request.FotoKey ?? existing.FotoKey;
+            existing.CapturedBy = request.CapturedBy;
+            existing.CapturedAt = request.CapturedAt ?? DateTime.UtcNow.ToString("o");
+            existing.Source = request.Source;
+            operationStatus = "updated";
+            log.LogInformation("Tombamento {IdPatomb} atualizado.", existing.IdPatomb);
+        }
+        else
+        {
+            // 3b. Adicionar novo tombamento
+            var novo = new TombamentoRecord
+            {
+                IdPatomb = request.IdPatomb,
+                Nutomb = request.Nutomb,
+                Estado = request.Estado,
+                Dataestado = today,
+                Situacao = request.Situacao,
+                Datasituacao = today,
+                IdLocalizacao = request.IdLocalizacao,
+                FotoKey = request.FotoKey,
+                CapturedBy = request.CapturedBy,
+                CapturedAt = request.CapturedAt ?? DateTime.UtcNow.ToString("o"),
+                Source = request.Source
+            };
+            tombamentos.Add(novo);
+            existing = novo;
+            operationStatus = "created";
+            log.LogInformation("Tombamento {IdPatomb} criado.", novo.IdPatomb);
+        }
+
+        // 4. Serializar e fazer PutObject
+        var updatedJson = JsonSerializer.SerializeToUtf8Bytes(root, writeOptions);
+        using var ms = new MemoryStream(updatedJson);
+        await s3.PutObjectAsync(new PutObjectRequest
+        {
+            BucketName = bucket,
+            Key = s3Key,
+            InputStream = ms,
+            ContentType = "application/json"
+        });
+
+        // 5. Invalidar cache do chunk index
+        var cacheKey = $"TOMB-INDEX:{bucket}:{s3Key}:";
+        // Remove todas as entradas de cache que começam com esse prefixo (versão simples)
+        cache.Remove(cacheKey);
+
+        return Results.Ok(new CaptureItemResponse(
+            IdPatomb: existing.IdPatomb,
+            Nutomb: existing.Nutomb,
+            Status: operationStatus,
+            UpdatedAt: DateTime.UtcNow.ToString("o")
+        ));
+    }
+    catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+    {
+        log.LogWarning("Arquivo {S3Key} não encontrado.", s3Key);
+        return Results.NotFound(new { error = $"Prefixo '{request.Prefixo}' não encontrado." });
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "Erro ao salvar captura para {Prefixo}", request.Prefixo);
+        return Results.Problem(ex.Message);
+    }
+})
+.WithName("CaptureItem")
+.WithOpenApi()
+.WithTags("Capture");
+
+// ─── ENDPOINT: GET /api/capture/validate/{nutomb} ────────────────────────────
+app.MapGet("/api/capture/validate/{nutomb}", async (
+    string nutomb,
+    [FromQuery] string? prefix,
+    [FromServices] IAmazonS3 s3,
+    [FromServices] IConfiguration config,
+    [FromServices] IMemoryCache cache,
+    ILogger<Program> log) =>
+{
+    if (string.IsNullOrWhiteSpace(prefix))
+        return Results.BadRequest(new { error = "prefix é obrigatório." });
+
+    var bucket = config["AWS:BucketName"];
+    if (string.IsNullOrEmpty(bucket))
+        return Results.Problem("Bucket não configurado.");
+
+    var s3Key = $"usuarios/{prefix.ToUpper()}.json";
+
+    try
+    {
+        var readOptions = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        };
+
+        UnifiedDataRecord root;
+        using (var obj = await s3.GetObjectAsync(bucket, s3Key))
+        using (var stream = obj.ResponseStream)
+        {
+            root = await JsonSerializer.DeserializeAsync<UnifiedDataRecord>(stream, readOptions)
+                   ?? throw new InvalidOperationException("Arquivo inválido.");
+        }
+
+        var tombamento = root.Tabelas?.Tombamentos?
+            .FirstOrDefault(t => t.Nutomb == nutomb);
+
+        if (tombamento is null)
+        {
+            return Results.Ok(new ValidateTombamentoResponse(
+                Exists: false, IdPatomb: null, Nutomb: nutomb,
+                Esfera: null, Deprod: null, Cdprod: null,
+                Estado: null, Situacao: null, IdLocalizacao: null));
+        }
+
+        return Results.Ok(new ValidateTombamentoResponse(
+            Exists: true,
+            IdPatomb: tombamento.IdPatomb,
+            Nutomb: tombamento.Nutomb,
+            Esfera: tombamento.Esfera,
+            Deprod: tombamento.Deprod,
+            Cdprod: tombamento.Cdprod,
+            Estado: tombamento.Estado,
+            Situacao: tombamento.Situacao,
+            IdLocalizacao: tombamento.IdLocalizacao));
+    }
+    catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+    {
+        return Results.NotFound(new { error = $"Prefixo '{prefix}' não encontrado." });
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "Erro ao validar tombamento {Nutomb}", nutomb);
+        return Results.Problem(ex.Message);
+    }
+})
+.WithName("ValidateTombamento")
+.WithOpenApi()
+.WithTags("Capture");
+
+// ─── ENDPOINT: GET /api/capture/list ─────────────────────────────────────────
+app.MapGet("/api/capture/list", async (
+    [FromQuery] string prefix,
+    [FromQuery] string? cdorgao,
+    [FromQuery] string? cdunid,
+    [FromServices] IAmazonS3 s3,
+    [FromServices] IConfiguration config,
+    ILogger<Program> log) =>
+{
+    if (string.IsNullOrWhiteSpace(prefix))
+        return Results.BadRequest(new { error = "prefix é obrigatório." });
+
+    var bucket = config["AWS:BucketName"];
+    if (string.IsNullOrEmpty(bucket))
+        return Results.Problem("Bucket não configurado.");
+
+    var s3Key = $"usuarios/{prefix.ToUpper()}.json";
+
+    try
+    {
+        var readOptions = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        };
+
+        UnifiedDataRecord root;
+        using (var obj = await s3.GetObjectAsync(bucket, s3Key))
+        using (var stream = obj.ResponseStream)
+        {
+            root = await JsonSerializer.DeserializeAsync<UnifiedDataRecord>(stream, readOptions)
+                   ?? throw new InvalidOperationException("Arquivo inválido.");
+        }
+
+        var tombamentos = root.Tabelas?.Tombamentos ?? new List<TombamentoRecord>();
+
+        // Filtrar apenas os que foram capturados (situacao != null)
+        var query = tombamentos.Where(t => t.Situacao != null);
+
+        if (!string.IsNullOrWhiteSpace(cdorgao))
+            query = query.Where(t => t.CdOrgao == cdorgao);
+
+        if (!string.IsNullOrWhiteSpace(cdunid))
+            query = query.Where(t => t.CdUnid == cdunid);
+
+        var result = query.Select(t => new CapturedItemSummary(
+            IdPatomb: t.IdPatomb,
+            Nutomb: t.Nutomb,
+            Deprod: t.Deprod,
+            Estado: t.Estado,
+            Situacao: t.Situacao,
+            Esfera: t.Esfera
+        )).ToList();
+
+        return Results.Ok(result);
+    }
+    catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+    {
+        return Results.NotFound(new { error = $"Prefixo '{prefix}' não encontrado." });
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "Erro ao listar capturas para {Prefix}", prefix);
+        return Results.Problem(ex.Message);
+    }
+})
+.WithName("ListCapturedItems")
+.WithOpenApi()
+.WithTags("Capture");
+
+// ─── ENDPOINT: POST /api/capture/sync ────────────────────────────────────────
+app.MapPost("/api/capture/sync", async (
+    [FromBody] SyncBatchRequest request,
+    [FromServices] IAmazonS3 s3,
+    [FromServices] IConfiguration config,
+    [FromServices] IMemoryCache cache,
+    ILogger<Program> log) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Prefixo))
+        return Results.BadRequest(new { error = "prefixo é obrigatório." });
+
+    if (request.Items == null || request.Items.Count == 0)
+        return Results.Ok(new SyncBatchResponse(0, 0, 0, 0, new List<SyncItemResult>()));
+
+    if (request.Items.Count > 50)
+        return Results.BadRequest(new { error = "Máximo de 50 itens por batch." });
+
+    var bucket = config["AWS:BucketName"];
+    if (string.IsNullOrEmpty(bucket))
+        return Results.Problem("Bucket não configurado.");
+
+    var s3Key = $"usuarios/{request.Prefixo.ToUpper()}.json";
+    var writeOptions = new JsonSerializerOptions
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
+    try
+    {
+        // 1. Carregar arquivo uma única vez
+        UnifiedDataRecord root;
+        using (var obj = await s3.GetObjectAsync(bucket, s3Key))
+        using (var stream = obj.ResponseStream)
+        {
+            root = await JsonSerializer.DeserializeAsync<UnifiedDataRecord>(stream, writeOptions)
+                   ?? throw new InvalidOperationException("Arquivo inválido.");
+        }
+
+        var tombamentos = root.Tabelas?.Tombamentos
+            ?? throw new InvalidOperationException("Seção tombamentos ausente.");
+
+        var results = new List<SyncItemResult>();
+        int updated = 0, created = 0, failed = 0;
+        var today = int.Parse(DateTime.UtcNow.ToString("yyyyMMdd"));
+
+        // 2. Processar cada item em memória
+        foreach (var item in request.Items)
+        {
+            try
+            {
+                var existing = tombamentos.FirstOrDefault(t => t.IdPatomb == item.IdPatomb)
+                            ?? tombamentos.FirstOrDefault(t => t.Nutomb == item.Nutomb);
+
+                string opStatus;
+                if (existing is not null)
+                {
+                    existing.Estado = item.Estado ?? existing.Estado;
+                    existing.Dataestado = today;
+                    existing.Situacao = item.Situacao ?? existing.Situacao;
+                    existing.Datasituacao = today;
+                    existing.IdLocalizacao = item.IdLocalizacao ?? existing.IdLocalizacao;
+                    existing.FotoKey = item.FotoKey ?? existing.FotoKey;
+                    existing.CapturedBy = item.CapturedBy;
+                    existing.CapturedAt = item.CapturedAt ?? DateTime.UtcNow.ToString("o");
+                    existing.Source = item.Source;
+                    opStatus = "updated";
+                    updated++;
+                }
+                else
+                {
+                    tombamentos.Add(new TombamentoRecord
+                    {
+                        IdPatomb = item.IdPatomb,
+                        Nutomb = item.Nutomb,
+                        Estado = item.Estado,
+                        Dataestado = today,
+                        Situacao = item.Situacao,
+                        Datasituacao = today,
+                        IdLocalizacao = item.IdLocalizacao,
+                        FotoKey = item.FotoKey,
+                        CapturedBy = item.CapturedBy,
+                        CapturedAt = item.CapturedAt ?? DateTime.UtcNow.ToString("o"),
+                        Source = item.Source
+                    });
+                    opStatus = "created";
+                    created++;
+                }
+
+                results.Add(new SyncItemResult(item.IdPatomb, item.Nutomb, opStatus));
+            }
+            catch (Exception ex)
+            {
+                log.LogWarning(ex, "Falha ao processar item {IdPatomb}", item.IdPatomb);
+                results.Add(new SyncItemResult(item.IdPatomb, item.Nutomb, "failed"));
+                failed++;
+            }
+        }
+
+        // 3. Um único PutObject para o batch inteiro
+        var updatedJson = JsonSerializer.SerializeToUtf8Bytes(root, writeOptions);
+        using var ms = new MemoryStream(updatedJson);
+        await s3.PutObjectAsync(new PutObjectRequest
+        {
+            BucketName = bucket,
+            Key = s3Key,
+            InputStream = ms,
+            ContentType = "application/json"
+        });
+
+        // 4. Invalidar cache
+        cache.Remove($"TOMB-INDEX:{bucket}:{s3Key}:");
+
+        log.LogInformation("Sync batch: {Updated} atualizados, {Created} criados, {Failed} falhas",
+            updated, created, failed);
+
+        return Results.Ok(new SyncBatchResponse(
+            Total: request.Items.Count,
+            Updated: updated,
+            Created: created,
+            Failed: failed,
+            Results: results
+        ));
+    }
+    catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+    {
+        return Results.NotFound(new { error = $"Prefixo '{request.Prefixo}' não encontrado." });
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "Erro no sync batch para {Prefixo}", request.Prefixo);
+        return Results.Problem(ex.Message);
+    }
+})
+.WithName("SyncCaptureBatch")
+.WithOpenApi()
+.WithTags("Capture");
+
 app.Run();
 
 // ─── Funções auxiliares ───────────────────────────────────────────────────────
@@ -803,114 +1201,5 @@ static async Task<byte[]> SerializeChunkPayloadAsync(IAmazonS3 s3, string bucket
     return JsonSerializer.SerializeToUtf8Bytes(result, options);
 }
 
-// ─── DTOs e Records ───────────────────────────────────────────────────────────
-public record PresignedUrlRequest(string FileName, string ContentType, string AssetId, string AssetCode);
-public record PresignedUrlResponse(string Url, string Key);
-public record LoginRequest(string Usuario, string Senha);
-
-public record AuthResponse(
-    string NomeCompleto,
-    string Prefixo,
-    string Esfera,
-    List<OrgaoRecord> Orgaos,
-    List<TombamentoItemResponse> Tombamentos,
-    string Token
-);
-
-public record TombamentoItemResponse(long IdPatomb, string Nutomb, string Esfera, string Deprod);
-
-public class TombamentoCargaItem
-{
-    [JsonPropertyName("idpatomb")]
-    public long IdPatomb { get; set; }
-    [JsonPropertyName("nutomb")]
-    public string Nutomb { get; set; } = string.Empty;
-    [JsonPropertyName("deprod")]
-    public string Deprod { get; set; } = string.Empty;
-    [JsonPropertyName("esfera")]
-    public string Esfera { get; set; } = string.Empty;
-    [JsonPropertyName("cdorgao")]
-    public string CdOrgao { get; set; } = string.Empty;
-    [JsonPropertyName("cdunid")]
-    public string CdUnid { get; set; } = string.Empty;
-    [JsonPropertyName("cdarea")]
-    public string CdArea { get; set; } = string.Empty;
-    [JsonPropertyName("cdsarea")]
-    public string CdSArea { get; set; } = string.Empty;
-}
-
-// ─── Records para o JSON Unificado ───────────────────────────────────────────
-// CORREÇÃO BUG #1: [JsonPropertyName] garante que a desserialização case-insensitive
-// funcione corretamente com records posicionais em .NET
-
-public record UnifiedDataRecord(
-    [property: JsonPropertyName("cliente")] string? Cliente,
-    [property: JsonPropertyName("usuarios")] List<UserRecord>? Usuarios,
-    [property: JsonPropertyName("tabelas")] TabelasRecord? Tabelas
-);
-
-// CORREÇÃO BUG #2: NomeCompleto é nullable pois pode não existir no JSON
-public record UserRecord(
-    [property: JsonPropertyName("idusuario")] string IdUsuario,
-    [property: JsonPropertyName("nmusuario")] string NmUsuario,
-    [property: JsonPropertyName("pwdusuario")] string PwdUsuario,
-    [property: JsonPropertyName("esfera")] string Esfera,
-    [property: JsonPropertyName("nomecompleto")] string? NomeCompleto
-);
-
-public record TabelasRecord(
-    [property: JsonPropertyName("xxorga")] List<XxOrgaRecord> XxOrga,
-    [property: JsonPropertyName("xxunid")] List<XxUnidRecord> XxUnid,
-    [property: JsonPropertyName("paarea")] List<PaAreaRecord> PaArea,
-    [property: JsonPropertyName("pasarea")] List<PasAreaRecord> PasArea,
-    [property: JsonPropertyName("localizacao")] List<LocalizacaoRecord> Localizacao,
-    [property: JsonPropertyName("tombamentos")] List<TombamentoRecord> Tombamentos
-);
-
-public record XxOrgaRecord(
-    [property: JsonPropertyName("cdorgao")] string CdOrgao,
-    [property: JsonPropertyName("nmorgao")] string NmOrgao
-);
-
-public record XxUnidRecord(
-    [property: JsonPropertyName("cdorgao")] string CdOrgao,
-    [property: JsonPropertyName("cdunid")] string CdUnid,
-    [property: JsonPropertyName("nmunid")] string NmUnid
-);
-
-public record PaAreaRecord(
-    [property: JsonPropertyName("cdarea")] string CdArea,
-    [property: JsonPropertyName("nmarea")] string NmArea
-);
-
-public record PasAreaRecord(
-    [property: JsonPropertyName("cdsarea")] string CdSArea,
-    [property: JsonPropertyName("nmsarea")] string NmSArea
-);
-
-public record LocalizacaoRecord(
-    [property: JsonPropertyName("cdorgao")] string CdOrgao,
-    [property: JsonPropertyName("cdunid")] string CdUnid,
-    [property: JsonPropertyName("cdarea")] string CdArea,
-    [property: JsonPropertyName("cdsarea")] string CdSArea
-);
-
-public record TombamentoRecord(
-    [property: JsonPropertyName("idpatomb")] long IdPatomb,
-    [property: JsonPropertyName("nutomb")] string Nutomb,
-    [property: JsonPropertyName("deprod")] string Deprod,
-    [property: JsonPropertyName("esfera")] string Esfera,
-    [property: JsonPropertyName("cdorgao")] string CdOrgao,
-    [property: JsonPropertyName("cdunid")] string CdUnid,
-    [property: JsonPropertyName("cdarea")] string CdArea,
-    [property: JsonPropertyName("cdsarea")] string CdSArea
-);
-
-// ─── Records de resposta hierárquica ─────────────────────────────────────────
-public record OrgaoRecord(string IdOrgao, string NomeOrgao, List<UnidadeOrcamentariaRecord> UnidadesOrcamentarias);
-public record UnidadeOrcamentariaRecord(string IdUO, string NomeUO, List<AreaRecord> Areas);
-public record AreaRecord(string IdArea, string NomeArea, List<SubareaRecord> Subareas);
-public record SubareaRecord(string IdSubarea, string NomeSubarea);
-
-record ChunkMeta(int Start, int Count, string Hash);
-record ChunkIndex(string Version, int TotalRecords, string GlobalHash, List<ChunkMeta> Chunks, JsonSerializerOptions Options);
+// Required for WebApplicationFactory<Program> in integration tests
+public partial class Program { }
