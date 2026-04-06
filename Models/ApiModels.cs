@@ -68,7 +68,8 @@ public record TabelasRecord(
 
 public record XxOrgaRecord(
     [property: JsonPropertyName("cdorgao")] string CdOrgao,
-    [property: JsonPropertyName("nmorgao")] string NmOrgao
+    [property: JsonPropertyName("nmorgao")] string NmOrgao,
+    [property: JsonPropertyName("dtestr")]  int DtEstr = 0   // Exercício fiscal (YYYYMMDD); 0 quando ausente
 );
 
 public record XxUnidRecord(
@@ -88,10 +89,12 @@ public record PasAreaRecord(
 );
 
 public record LocalizacaoRecord(
+    [property: JsonPropertyName("idlocalizacao")] long IdLocalizacao,
     [property: JsonPropertyName("cdorgao")] string CdOrgao,
     [property: JsonPropertyName("cdunid")] string CdUnid,
     [property: JsonPropertyName("cdarea")] string CdArea,
-    [property: JsonPropertyName("cdsarea")] string CdSArea
+    [property: JsonPropertyName("cdsarea")] string CdSArea,
+    [property: JsonPropertyName("dtestr")] int DtEstr = 0
 );
 
 // Mutable class to support in-place updates during capture
@@ -181,7 +184,7 @@ public record SyncBatchResponse(
 );
 
 // ─── Records de resposta hierárquica ─────────────────────────────────────────
-public record OrgaoRecord(string IdOrgao, string NomeOrgao, List<UnidadeOrcamentariaRecord> UnidadesOrcamentarias);
+public record OrgaoRecord(string IdOrgao, string NomeOrgao, List<UnidadeOrcamentariaRecord> UnidadesOrcamentarias, int DtEstr = 0);
 public record UnidadeOrcamentariaRecord(string IdUO, string NomeUO, List<AreaRecord> Areas);
 public record AreaRecord(string IdArea, string NomeArea, List<SubareaRecord> Subareas);
 public record SubareaRecord(string IdSubarea, string NomeSubarea);

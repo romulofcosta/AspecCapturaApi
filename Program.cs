@@ -8,6 +8,7 @@ using System.Buffers;
 using System.IO.Compression;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -78,6 +79,16 @@ builder.Services.AddResponseCompression(options =>
 builder.Services.Configure<BrotliCompressionProviderOptions>(o => o.Level = CompressionLevel.Fastest);
 builder.Services.AddMemoryCache();
 
+// Configuração de JSON para Minimal APIs
+builder.Services.ConfigureHttpJsonOptions(options =>
+{
+    options.SerializerOptions.PropertyNameCaseInsensitive = true;
+    options.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
+    options.SerializerOptions.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
+    options.SerializerOptions.AllowTrailingCommas = true;
+    options.SerializerOptions.ReadCommentHandling = JsonCommentHandling.Skip;
+});
+
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
     {
@@ -119,7 +130,10 @@ app.UseExceptionHandler(errApp =>
     });
 });
 
-app.UseHttpsRedirection();
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHttpsRedirection();
+}
 app.UseCors("AllowSpecificOrigins");
 
 // Redirect root to Swagger UI
@@ -281,41 +295,282 @@ app.MapGet("/api/storage/exists/{*filePath}", async (
 .WithOpenApi()
 .WithTags("Storage");
 
+if (app.Environment.IsDevelopment())
+{
+    app.MapGet("/api/localdata/status", (
+        [FromQuery] string? prefix,
+        [FromServices] IConfiguration configuration) =>
+    {
+        var enabled = configuration.GetValue<bool?>("LocalData:Enabled") ?? false;
+
+        var resolvedPrefix = string.IsNullOrWhiteSpace(prefix) ? null : prefix.Trim().ToUpperInvariant();
+        var filePath =
+            resolvedPrefix is null ? null : configuration[$"LocalData:PrefixFiles:{resolvedPrefix}"];
+        filePath ??= configuration["LocalData:DefaultFile"];
+
+        var exists = !string.IsNullOrWhiteSpace(filePath) && File.Exists(filePath);
+        long? sizeBytes = null;
+        DateTime? lastWriteUtc = null;
+        if (exists)
+        {
+            var info = new FileInfo(filePath!);
+            sizeBytes = info.Length;
+            lastWriteUtc = info.LastWriteTimeUtc;
+        }
+
+        return Results.Ok(new
+        {
+            enabled,
+            prefix = resolvedPrefix,
+            filePath,
+            exists,
+            sizeBytes,
+            lastWriteUtc
+        });
+    })
+    .WithName("LocalDataStatus")
+    .WithOpenApi()
+    .WithTags("LocalData");
+
+    app.MapGet("/api/localdata/top-hierarchies", async (
+        [FromQuery] string prefix,
+        [FromQuery] int top,
+        [FromServices] IConfiguration configuration,
+        ILogger<Program> log) =>
+    {
+        if (string.IsNullOrWhiteSpace(prefix))
+            return Results.BadRequest(new { error = "prefix é obrigatório" });
+
+        if (top <= 0) top = 10;
+        if (top > 50) top = 50;
+
+        var enabled = configuration.GetValue<bool?>("LocalData:Enabled") ?? false;
+        if (!enabled)
+            return Results.Ok(new { enabled = false, prefix = prefix.Trim().ToUpperInvariant() });
+
+        var resolvedPrefix = prefix.Trim().ToUpperInvariant();
+        var filePath =
+            configuration[$"LocalData:PrefixFiles:{resolvedPrefix}"]
+            ?? configuration["LocalData:DefaultFile"];
+
+        if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+            return Results.NotFound(new { error = "Arquivo local não encontrado", prefix = resolvedPrefix, filePath });
+
+        var unified = await ReadUnifiedDataFromLocalFileAsync(filePath, jsonOptions, log);
+        var tombamentos = unified?.Tabelas?.Tombamentos ?? new List<TombamentoRecord>();
+
+        var topUos = tombamentos
+            .GroupBy(t => new { t.CdOrgao, t.CdUnid })
+            .Select(g => new { cdOrgao = g.Key.CdOrgao, cdUnid = g.Key.CdUnid, totalBens = g.Count() })
+            .OrderByDescending(x => x.totalBens)
+            .Take(top)
+            .ToList();
+
+        var bestUo = topUos.FirstOrDefault();
+        var topAreasForBest = new List<object>();
+
+        if (bestUo is not null)
+        {
+            var topAreasTyped = tombamentos
+                .Where(t => t.CdOrgao == bestUo.cdOrgao && t.CdUnid == bestUo.cdUnid)
+                .GroupBy(t => new { t.CdArea, t.CdSArea })
+                .Select(g => new { cdArea = g.Key.CdArea, cdSArea = g.Key.CdSArea, totalBens = g.Count() })
+                .OrderByDescending(x => x.totalBens)
+                .Take(top)
+                .ToList();
+
+            topAreasForBest = topAreasTyped.Cast<object>().ToList();
+        }
+
+        return Results.Ok(new
+        {
+            enabled = true,
+            prefix = resolvedPrefix,
+            filePath,
+            totalBens = tombamentos.Count,
+            topUos,
+            topAreasForBest
+        });
+    })
+    .WithName("LocalDataTopHierarchies")
+    .WithOpenApi()
+    .WithTags("LocalData");
+}
+
+app.MapGet("/api/tombamentos/localizacoes", async (
+    [FromQuery] string prefix,
+    [FromServices] IAmazonS3 s3,
+    [FromServices] IConfiguration config,
+    [FromServices] IWebHostEnvironment env,
+    [FromServices] IMemoryCache cache,
+    ILogger<Program> log) =>
+{
+    try
+    {
+        if (string.IsNullOrWhiteSpace(prefix))
+            return Results.BadRequest(new { error = "prefix é obrigatório" });
+
+        var upper = prefix.Trim().ToUpperInvariant();
+        var key = $"usuarios/{upper}.json";
+
+        var localEnabled = env.IsDevelopment() && (config.GetValue<bool?>("LocalData:Enabled") ?? false);
+        if (localEnabled)
+        {
+            var localFile =
+                config[$"LocalData:PrefixFiles:{upper}"]
+                ?? config[$"LocalData:PrefixFiles:{prefix}"]
+                ?? config["LocalData:DefaultFile"];
+
+            if (!string.IsNullOrWhiteSpace(localFile) && File.Exists(localFile))
+            {
+                var version = File.GetLastWriteTimeUtc(localFile);
+                var versionKey = version == default ? "0" : version.ToUniversalTime().ToString("yyyyMMddHHmmss");
+                var cacheKey = $"TOMB-LOC:LOCAL:{localFile}:{versionKey}";
+
+                if (!cache.TryGetValue(cacheKey, out List<object>? cached))
+                {
+                    var unified = await ReadUnifiedDataFromLocalFileAsync(localFile, jsonOptions, log);
+                    var locs = unified?.Tabelas?.Localizacao ?? new List<LocalizacaoRecord>();
+                    var best = locs
+                        .GroupBy(l => l.IdLocalizacao)
+                        .Select(g => g
+                            .OrderByDescending(l => l.DtEstr)
+                            .ThenBy(l => l.CdOrgao == "99" ? 1 : 0)
+                            .ThenBy(l => l.CdOrgao)
+                            .ThenBy(l => l.CdUnid)
+                            .First())
+                        .ToList();
+
+                    cached = best.Select(l => (object)new
+                    {
+                        idlocalizacao = l.IdLocalizacao,
+                        cdorgao = l.CdOrgao,
+                        cdunid = l.CdUnid,
+                        cdarea = l.CdArea,
+                        cdsarea = l.CdSArea
+                    }).ToList();
+                    cache.Set(cacheKey, cached, TimeSpan.FromHours(1));
+                }
+
+                return Results.Ok(cached);
+            }
+        }
+
+        var bucket = config["AWS:BucketName"];
+        if (string.IsNullOrEmpty(bucket))
+            return Results.Problem("Bucket não configurado.");
+
+        var head = await s3.GetObjectMetadataAsync(bucket, key);
+        var dt = head.LastModified ?? DateTime.UtcNow;
+        var ver = dt.ToUniversalTime().ToString("yyyyMMddHHmmss");
+        var s3CacheKey = $"TOMB-LOC:{bucket}:{key}:{ver}";
+
+        if (!cache.TryGetValue(s3CacheKey, out List<object>? cachedS3))
+        {
+            using var obj = await s3.GetObjectAsync(bucket, key);
+            using var stream = obj.ResponseStream;
+            var unified = await JsonSerializer.DeserializeAsync<UnifiedDataRecord>(stream, jsonOptions);
+            var locs = unified?.Tabelas?.Localizacao ?? new List<LocalizacaoRecord>();
+            var best = locs
+                .GroupBy(l => l.IdLocalizacao)
+                .Select(g => g
+                    .OrderByDescending(l => l.DtEstr)
+                    .ThenBy(l => l.CdOrgao == "99" ? 1 : 0)
+                    .ThenBy(l => l.CdOrgao)
+                    .ThenBy(l => l.CdUnid)
+                    .First())
+                .ToList();
+
+            cachedS3 = best.Select(l => (object)new
+            {
+                idlocalizacao = l.IdLocalizacao,
+                cdorgao = l.CdOrgao,
+                cdunid = l.CdUnid,
+                cdarea = l.CdArea,
+                cdsarea = l.CdSArea
+            }).ToList();
+            cache.Set(s3CacheKey, cachedS3, TimeSpan.FromHours(1));
+        }
+
+        return Results.Ok(cachedS3);
+    }
+    catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+    {
+        return Results.NotFound(new { error = $"Prefixo '{prefix}' não encontrado." });
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "Erro ao listar localizacoes para {Prefix}", prefix);
+        return Results.Problem(ex.Message);
+    }
+})
+.WithName("GetLocalizacoes")
+.WithOpenApi()
+.WithTags("Tombamentos");
+
 
 // ─── ENDPOINT: Login ──────────────────────────────────────────────────────────
 app.MapPost("/api/auth/login", async (
     [FromBody] LoginRequest request,
     [FromServices] IAmazonS3 s3Client,
     [FromServices] IConfiguration configuration,
+    [FromServices] IWebHostEnvironment env,
     ILogger<Program> log) =>
 {
-    if (string.IsNullOrWhiteSpace(request.Usuario) || string.IsNullOrWhiteSpace(request.Senha))
+    var usuario = request.Usuario?.Trim() ?? string.Empty;
+    var senha = request.Senha?.Trim() ?? string.Empty;
+
+    if (string.IsNullOrWhiteSpace(usuario) || string.IsNullOrWhiteSpace(senha))
         return Results.BadRequest(new { error = "Usuário e Senha são obrigatórios." });
 
-    var bucketName = configuration["AWS:BucketName"];
-    if (string.IsNullOrEmpty(bucketName))
-        return Results.Problem("Bucket não configurado.");
-
     // Formato esperado: ce999.nome1.sbnome1
-    var parts = request.Usuario.Split('.', 2);
+    var parts = usuario.Split('.', 2);
     if (parts.Length < 2)
     {
-        log.LogWarning("Formato de usuário inválido: {Usuario}", request.Usuario);
+        log.LogWarning("Formato de usuário inválido: {Usuario}", usuario);
         return Results.BadRequest(new { error = "Formato de usuário inválido. Use: municipio.usuario" });
     }
 
     var prefix = parts[0].ToUpper();
     var s3Key = $"usuarios/{prefix}.json";
+    var s3KeyLower = $"usuarios/{parts[0].ToLower()}.json";
 
-    log.LogInformation("Tentativa de login para município {Prefix}, usuário {Usuario}", prefix, request.Usuario);
+    log.LogInformation("Tentativa de login para município {Prefix}, usuário {Usuario}", prefix, usuario);
 
     try
     {
+        UnifiedDataRecord? root = null;
+
+        var localEnabled = env.IsDevelopment() && (configuration.GetValue<bool?>("LocalData:Enabled") ?? false);
+        if (localEnabled)
+        {
+            var localFile =
+                configuration[$"LocalData:PrefixFiles:{prefix}"]
+                ?? configuration[$"LocalData:PrefixFiles:{parts[0]}"]
+                ?? configuration["LocalData:DefaultFile"];
+
+            if (!string.IsNullOrWhiteSpace(localFile) && File.Exists(localFile))
+            {
+                log.LogInformation("Login: Usando fonte local para prefix {Prefix}: {File}", prefix, localFile);
+                root = await ReadUnifiedDataFromLocalFileAsync(localFile, jsonOptions, log);
+            }
+        }
+
         // 1. Carrega dados de usuário
-        using var s3Response = await s3Client.GetObjectAsync(bucketName, s3Key);
-        using var reader = new StreamReader(s3Response.ResponseStream);
-        var json = await reader.ReadToEndAsync();
-        var root = JsonSerializer.Deserialize<UnifiedDataRecord>(json, jsonOptions);
+        if (root is null)
+        {
+            var bucketName = configuration["AWS:BucketName"];
+            if (string.IsNullOrEmpty(bucketName))
+                return Results.Problem("Bucket não configurado.");
+
+            using Amazon.S3.Model.GetObjectResponse s3Response = await GetS3ObjectWithFallback(s3Client, bucketName, s3Key, s3KeyLower, log);
+
+            using var responseStream = s3Response.ResponseStream;
+            using var reader = new StreamReader(responseStream);
+            var json = await reader.ReadToEndAsync();
+            root = JsonSerializer.Deserialize<UnifiedDataRecord>(json, jsonOptions);
+        }
+
         if (root?.Usuarios == null || root.Usuarios.Count == 0)
         {
             log.LogWarning("Arquivo {S3Key} não contém usuários válidos.", s3Key);
@@ -323,16 +578,16 @@ app.MapPost("/api/auth/login", async (
         }
         var restOfUsername = parts[1].ToLower();
         var user = root.Usuarios.FirstOrDefault(u =>
-            string.Equals(u.NmUsuario, request.Usuario, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(u.NmUsuario, usuario, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(u.NmUsuario, restOfUsername, StringComparison.OrdinalIgnoreCase));
         if (user is null)
         {
-            log.LogWarning("Usuário '{Usuario}' não encontrado.", request.Usuario);
+            log.LogWarning("Usuário '{Usuario}' não encontrado.", usuario);
             return Results.Unauthorized();
         }
-        if (user.PwdUsuario != request.Senha)
+        if (!string.Equals(user.PwdUsuario?.Trim(), senha, StringComparison.Ordinal))
         {
-            log.LogWarning("Senha inválida para usuário '{Usuario}'.", request.Usuario);
+            log.LogWarning("Senha inválida para usuário '{Usuario}'.", usuario);
             return Results.Unauthorized();
         }
         log.LogInformation("Login bem-sucedido: {Usuario}, Esfera: {Esfera}", user.NmUsuario, user.Esfera);
@@ -374,7 +629,7 @@ app.MapPost("/api/auth/login", async (
         // 5. Filtra patrimônio para árvore de órgãos (dados de apoio)
         var orgaos = BuildOrgaoHierarchy(user.Esfera, tombamentoFiltrado, tabelas);
 
-        var tombamentos = tombamentoFiltrado.Select(p => new TombamentoItemResponse(p.IdPatomb, p.Nutomb, p.Esfera, p.Deprod)).AsQueryable();
+        var tombamentos = Enumerable.Empty<TombamentoItemResponse>().AsQueryable();
 
         return Results.Stream(async stream =>
         {
@@ -385,7 +640,7 @@ app.MapPost("/api/auth/login", async (
                 Orgaos: orgaos,
                 Tombamentos: tombamentos.ToList(),
                 Token: Guid.NewGuid().ToString()
-            ));
+            ), jsonOptions); // Passamos jsonOptions aqui!
         }, "application/json");
     }
     catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
@@ -412,6 +667,7 @@ app.MapGet("/api/tombamentos/sync-info", async (
     [FromQuery] string prefix,
     [FromServices] IAmazonS3 s3,
     [FromServices] IConfiguration config,
+    [FromServices] IWebHostEnvironment env,
     [FromServices] IMemoryCache cache,
     ILogger<Program> log) =>
 {
@@ -423,16 +679,40 @@ app.MapGet("/api/tombamentos/sync-info", async (
             return Results.BadRequest(new { error = "prefix é obrigatório" });
         }
         
+        var key = $"usuarios/{prefix.ToUpper()}.json";
+        log.LogInformation("SyncInfo: Processando key={Key}", key);
+
+        var localEnabled = env.IsDevelopment() && (config.GetValue<bool?>("LocalData:Enabled") ?? false);
+        if (localEnabled)
+        {
+            var localFile =
+                config[$"LocalData:PrefixFiles:{prefix.ToUpper()}"]
+                ?? config[$"LocalData:PrefixFiles:{prefix}"]
+                ?? config["LocalData:DefaultFile"];
+
+            if (!string.IsNullOrWhiteSpace(localFile) && File.Exists(localFile))
+            {
+                var indexLocal = await BuildOrGetChunkIndexFromLocalAsync(localFile, cache);
+                log.LogInformation("SyncInfo: Sucesso (LOCAL) - {TotalRegistros} registros, {TotalChunks} chunks",
+                    indexLocal.TotalRecords, indexLocal.Chunks.Count);
+
+                return Results.Ok(new
+                {
+                    totalRegistros = indexLocal.TotalRecords,
+                    totalChunks = indexLocal.Chunks.Count,
+                    versao = indexLocal.Version,
+                    hashGlobal = indexLocal.GlobalHash
+                });
+            }
+        }
+
         var bucket = config["AWS:BucketName"];
         if (string.IsNullOrEmpty(bucket))
         {
             log.LogError("SyncInfo: Bucket não configurado");
             return Results.Problem("Bucket não configurado.");
         }
-        
-        var key = $"usuarios/{prefix.ToUpper()}.json";
-        log.LogInformation("SyncInfo: Processando key={Key}", key);
-        
+
         // Verifica se o arquivo existe antes de processar
         try
         {
@@ -443,7 +723,7 @@ app.MapGet("/api/tombamentos/sync-info", async (
             log.LogWarning("SyncInfo: Arquivo não encontrado: {Key}", key);
             return Results.NotFound(new { error = $"Arquivo {key} não encontrado no bucket {bucket}" });
         }
-        
+
         var index = await BuildOrGetChunkIndexAsync(s3, bucket, key, cache);
         
         log.LogInformation("SyncInfo: Sucesso - {TotalRegistros} registros, {TotalChunks} chunks", 
@@ -476,6 +756,7 @@ app.MapGet("/api/tombamentos/lote/{id:int}", async (
     [FromQuery] string prefix,
     [FromServices] IAmazonS3 s3,
     [FromServices] IConfiguration config,
+    [FromServices] IWebHostEnvironment env,
     [FromServices] IMemoryCache cache,
     ILogger<Program> log) =>
 {
@@ -487,16 +768,52 @@ app.MapGet("/api/tombamentos/lote/{id:int}", async (
             return Results.BadRequest(new { error = "prefix é obrigatório" });
         }
         
+        var key = $"usuarios/{prefix.ToUpper()}.json";
+        log.LogInformation("Lote: Processando chunk {ChunkId} para key={Key}", id, key);
+
+        var localEnabled = env.IsDevelopment() && (config.GetValue<bool?>("LocalData:Enabled") ?? false);
+        if (localEnabled)
+        {
+            var localFile =
+                config[$"LocalData:PrefixFiles:{prefix.ToUpper()}"]
+                ?? config[$"LocalData:PrefixFiles:{prefix}"]
+                ?? config["LocalData:DefaultFile"];
+
+            if (!string.IsNullOrWhiteSpace(localFile) && File.Exists(localFile))
+            {
+                var indexLocal = await BuildOrGetChunkIndexFromLocalAsync(localFile, cache);
+
+                if (id < 1 || id > indexLocal.Chunks.Count)
+                {
+                    log.LogWarning("Lote: ChunkId {ChunkId} inválido (total: {Total})", id, indexLocal.Chunks.Count);
+                    return Results.NotFound(new { error = $"chunkId {id} inválido (total: {indexLocal.Chunks.Count})" });
+                }
+
+                var chunkMetaLocal = indexLocal.Chunks[id - 1];
+                var cacheKeyLocal = $"TOMB-CHUNK:LOCAL:{localFile}:{indexLocal.Version}:{id}";
+
+                if (!cache.TryGetValue<byte[]>(cacheKeyLocal, out var payloadLocal))
+                {
+                    log.LogInformation("Lote: Gerando payload (LOCAL) para chunk {ChunkId}", id);
+                    payloadLocal = await SerializeChunkPayloadFromLocalAsync(localFile, chunkMetaLocal, indexLocal.Options);
+                    cache.Set(cacheKeyLocal, payloadLocal, TimeSpan.FromHours(1));
+                }
+                else
+                {
+                    log.LogInformation("Lote: Usando payload em cache (LOCAL) para chunk {ChunkId}", id);
+                }
+
+                return Results.Bytes(payloadLocal!, "application/json");
+            }
+        }
+
         var bucket = config["AWS:BucketName"];
         if (string.IsNullOrEmpty(bucket))
         {
             log.LogError("Lote: Bucket não configurado");
             return Results.Problem("Bucket não configurado.");
         }
-        
-        var key = $"usuarios/{prefix.ToUpper()}.json";
-        log.LogInformation("Lote: Processando chunk {ChunkId} para key={Key}", id, key);
-        
+
         var index = await BuildOrGetChunkIndexAsync(s3, bucket, key, cache);
         
         if (id < 1 || id > index.Chunks.Count)
@@ -942,13 +1259,18 @@ static List<OrgaoRecord> BuildOrgaoHierarchy(
 {
     var orgaos = new List<OrgaoRecord>();
 
-    var targetOrgaoCodes = esfera == "A"
-        ? tabelas.XxOrga.Select(o => o.CdOrgao).Distinct()
-        : filteredTombamento.Select(p => p.CdOrgao).Distinct();
+    var targetOrgaoKeys = esfera == "A"
+        ? tabelas.XxOrga.Select(o => (o.DtEstr, o.CdOrgao)).Distinct()
+        : filteredTombamento
+            .Join(tabelas.XxOrga,
+                  t => t.CdOrgao,
+                  o => o.CdOrgao,
+                  (t, o) => (o.DtEstr, t.CdOrgao))
+            .Distinct();
 
-    foreach (var orgCode in targetOrgaoCodes)
+    foreach (var (dtEstr, orgCode) in targetOrgaoKeys)
     {
-        var orgInfo = tabelas.XxOrga.FirstOrDefault(o => o.CdOrgao == orgCode);
+        var orgInfo = tabelas.XxOrga.FirstOrDefault(o => o.DtEstr == dtEstr && o.CdOrgao == orgCode);
         if (orgInfo is null) continue;
 
         var targetUoCodes = esfera == "A"
@@ -997,10 +1319,28 @@ static List<OrgaoRecord> BuildOrgaoHierarchy(
             uos.Add(new UnidadeOrcamentariaRecord(uoCode, uoInfo.NmUnid, areas));
         }
 
-        orgaos.Add(new OrgaoRecord(orgCode, orgInfo.NmOrgao, uos));
+        orgaos.Add(new OrgaoRecord(orgCode, orgInfo.NmOrgao, uos, dtEstr));
     }
 
     return orgaos;
+}
+
+static async Task<Amazon.S3.Model.GetObjectResponse> GetS3ObjectWithFallback(
+    IAmazonS3 s3Client, 
+    string bucket, 
+    string primaryKey, 
+    string fallbackKey, 
+    ILogger log)
+{
+    try
+    {
+        return await s3Client.GetObjectAsync(bucket, primaryKey);
+    }
+    catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+    {
+        log.LogInformation("Arquivo '{PrimaryKey}' não encontrado, tentando '{FallbackKey}'", primaryKey, fallbackKey);
+        return await s3Client.GetObjectAsync(bucket, fallbackKey);
+    }
 }
 
 static async Task<ChunkIndex> BuildOrGetChunkIndexAsync(IAmazonS3 s3, string bucket, string key, IMemoryCache cache)
@@ -1067,6 +1407,60 @@ static async Task<ChunkIndex> BuildOrGetChunkIndexAsync(IAmazonS3 s3, string buc
         await FinalizeChunkAsync(current, total, sha256, globalHashCtx, chunks, options);
     }
     
+    var globalHash = Convert.ToHexString(globalHashCtx.GetHashAndReset());
+    var index = new ChunkIndex(version, total, globalHash, chunks, options);
+    cache.Set(cacheKey, index, TimeSpan.FromHours(1));
+    return index;
+}
+
+static async Task<ChunkIndex> BuildOrGetChunkIndexFromLocalAsync(string filePath, IMemoryCache cache)
+{
+    var dt = File.GetLastWriteTimeUtc(filePath);
+    if (dt == default) dt = DateTime.UtcNow;
+    var version = dt.ToUniversalTime().ToString("yyyyMMddHHmmss");
+    var cacheKey = $"TOMB-INDEX:LOCAL:{filePath}:{version}";
+    if (cache.TryGetValue<ChunkIndex>(cacheKey, out var cached) && cached is not null)
+        return cached;
+
+    var options = new JsonSerializerOptions
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
+    const int MaxItemsPerChunk = 5000;
+    var chunks = new List<ChunkMeta>();
+    using var sha256 = SHA256.Create();
+    var globalHashCtx = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+    var total = 0;
+    var current = new List<TombamentoRecord>();
+
+    var unifiedData = await ReadUnifiedDataFromLocalFileAsync(filePath, options);
+    var itens = unifiedData?.Tabelas?.Tombamentos?.ToList();
+
+    if (itens is null || itens.Count == 0)
+    {
+        var emptyIndex = new ChunkIndex(version, 0, "", new List<ChunkMeta>(), options);
+        cache.Set(cacheKey, emptyIndex, TimeSpan.FromHours(1));
+        return emptyIndex;
+    }
+
+    foreach (var item in itens)
+    {
+        if (item is null) continue;
+        current.Add(item);
+        total++;
+
+        if (current.Count >= MaxItemsPerChunk)
+        {
+            await FinalizeChunkAsync(current, total, sha256, globalHashCtx, chunks, options);
+            current.Clear();
+        }
+    }
+
+    if (current.Count > 0)
+        await FinalizeChunkAsync(current, total, sha256, globalHashCtx, chunks, options);
+
     var globalHash = Convert.ToHexString(globalHashCtx.GetHashAndReset());
     var index = new ChunkIndex(version, total, globalHash, chunks, options);
     cache.Set(cacheKey, index, TimeSpan.FromHours(1));
@@ -1199,6 +1593,57 @@ static async Task<byte[]> SerializeChunkPayloadAsync(IAmazonS3 s3, string bucket
     Console.WriteLine($"[INFO] SerializeChunkPayload: Chunk {result.chunkId} com {result.data.Count} registros");
     
     return JsonSerializer.SerializeToUtf8Bytes(result, options);
+}
+
+static async Task<byte[]> SerializeChunkPayloadFromLocalAsync(string filePath, ChunkMeta meta, JsonSerializerOptions options)
+{
+    var result = new
+    {
+        chunkId = (int)((meta.Start - 1) / meta.Count) + 1,
+        data = new List<TombamentoRecord>(meta.Count),
+        hash = meta.Hash
+    };
+
+    var unifiedData = await ReadUnifiedDataFromLocalFileAsync(filePath, options);
+    var allItems = unifiedData?.Tabelas?.Tombamentos?.ToList();
+
+    if (allItems is null || allItems.Count == 0)
+        return JsonSerializer.SerializeToUtf8Bytes(result, options);
+
+    var start = meta.Start;
+    var end = meta.Start + meta.Count - 1;
+
+    for (int i = start - 1; i < end && i < allItems.Count; i++)
+    {
+        var item = allItems[i];
+        if (item is not null)
+            result.data.Add(item);
+    }
+
+    return JsonSerializer.SerializeToUtf8Bytes(result, options);
+}
+
+static async Task<UnifiedDataRecord?> ReadUnifiedDataFromLocalFileAsync(string filePath, JsonSerializerOptions options, ILogger? log = null)
+{
+    try
+    {
+        await using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        return await JsonSerializer.DeserializeAsync<UnifiedDataRecord>(fs, options);
+    }
+    catch (JsonException ex)
+    {
+        log?.LogWarning(ex, "Falha ao deserializar como UTF-8, tentando fallback Latin1. File={File}", filePath);
+        try
+        {
+            var bytes = await File.ReadAllBytesAsync(filePath);
+            var text = Encoding.Latin1.GetString(bytes);
+            return JsonSerializer.Deserialize<UnifiedDataRecord>(text, options);
+        }
+        catch
+        {
+            throw;
+        }
+    }
 }
 
 // Required for WebApplicationFactory<Program> in integration tests
