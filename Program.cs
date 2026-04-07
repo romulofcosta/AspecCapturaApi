@@ -620,9 +620,23 @@ app.MapPost("/api/auth/login", async (
         
         log.LogInformation("Tombamentos encontrados em tabelas.tombamentos: {Count}", tombamentoBase.Count);
 
+        // NOVO: Filtro de exercício fiscal corrente
+        var exercicioCorrente = DateTime.Now.Year;
+        var tombamentoFiltradoExercicio = tombamentoBase
+            .Where(p => p.ExercicioFiscal == exercicioCorrente || p.ExercicioFiscal == 0)
+            .ToList();
+
+        log.LogInformation(
+            "Tombamentos filtrados para exercício {Exercicio}: {Count} (de {Total})", 
+            exercicioCorrente, 
+            tombamentoFiltradoExercicio.Count, 
+            tombamentoBase.Count
+        );
+
+        // Filtro de esfera
         var tombamentoFiltrado = user.Esfera == "A"
-            ? tombamentoBase
-            : tombamentoBase.Where(p => p.Esfera == user.Esfera).ToList();
+            ? tombamentoFiltradoExercicio
+            : tombamentoFiltradoExercicio.Where(p => p.Esfera == user.Esfera).ToList();
 
         log.LogInformation("Tombamentos filtrados para esfera {Esfera}: {Count}", user.Esfera, tombamentoFiltrado.Count);
 
@@ -1385,9 +1399,16 @@ static async Task<ChunkIndex> BuildOrGetChunkIndexAsync(IAmazonS3 s3, string buc
         return emptyIndex;
     }
 
-    Console.WriteLine($"[INFO] Processando {itens.Count} tombamentos de {key}");
+    // Aplica filtro de exercício fiscal corrente
+    var exercicioCorrente = DateTime.Now.Year;
+    var itensFiltrados = itens
+        .Where(p => p.ExercicioFiscal == exercicioCorrente || p.ExercicioFiscal == 0)
+        .ToList();
 
-    foreach (var item in itens)
+    Console.WriteLine($"[INFO] Processando {itens.Count} tombamentos de {key}");
+    Console.WriteLine($"[INFO] Tombamentos filtrados para exercício {exercicioCorrente}: {itensFiltrados.Count}");
+
+    foreach (var item in itensFiltrados)
     {
         if (item is null) continue;
         current.Add(item);
@@ -1445,7 +1466,15 @@ static async Task<ChunkIndex> BuildOrGetChunkIndexFromLocalAsync(string filePath
         return emptyIndex;
     }
 
-    foreach (var item in itens)
+    // Aplica filtro de exercício fiscal corrente
+    var exercicioCorrente = DateTime.Now.Year;
+    var itensFiltrados = itens
+        .Where(p => p.ExercicioFiscal == exercicioCorrente || p.ExercicioFiscal == 0)
+        .ToList();
+
+    Console.WriteLine($"[INFO] Tombamentos filtrados para exercício {exercicioCorrente}: {itensFiltrados.Count} (de {itens.Count})");
+
+    foreach (var item in itensFiltrados)
     {
         if (item is null) continue;
         current.Add(item);
@@ -1577,13 +1606,19 @@ static async Task<byte[]> SerializeChunkPayloadAsync(IAmazonS3 s3, string bucket
         return JsonSerializer.SerializeToUtf8Bytes(result, options);
     }
     
+    // Aplica filtro de exercício fiscal corrente
+    var exercicioCorrente = DateTime.Now.Year;
+    var itemsFiltrados = allItems
+        .Where(p => p.ExercicioFiscal == exercicioCorrente || p.ExercicioFiscal == 0)
+        .ToList();
+    
     var start = meta.Start;
     var end = meta.Start + meta.Count - 1;
     
     // Extrai apenas os itens do chunk especificado
-    for (int i = start - 1; i < end && i < allItems.Count; i++)
+    for (int i = start - 1; i < end && i < itemsFiltrados.Count; i++)
     {
-        var item = allItems[i];
+        var item = itemsFiltrados[i];
         if (item is not null)
         {
             result.data.Add(item);
@@ -1610,12 +1645,18 @@ static async Task<byte[]> SerializeChunkPayloadFromLocalAsync(string filePath, C
     if (allItems is null || allItems.Count == 0)
         return JsonSerializer.SerializeToUtf8Bytes(result, options);
 
+    // Aplica filtro de exercício fiscal corrente
+    var exercicioCorrente = DateTime.Now.Year;
+    var itemsFiltrados = allItems
+        .Where(p => p.ExercicioFiscal == exercicioCorrente || p.ExercicioFiscal == 0)
+        .ToList();
+
     var start = meta.Start;
     var end = meta.Start + meta.Count - 1;
 
-    for (int i = start - 1; i < end && i < allItems.Count; i++)
+    for (int i = start - 1; i < end && i < itemsFiltrados.Count; i++)
     {
-        var item = allItems[i];
+        var item = itemsFiltrados[i];
         if (item is not null)
             result.data.Add(item);
     }
