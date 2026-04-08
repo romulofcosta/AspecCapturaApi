@@ -741,7 +741,7 @@ app.MapGet("/api/tombamentos/sync-info", async (
             return Results.NotFound(new { error = $"Arquivo {key} não encontrado no bucket {bucket}" });
         }
 
-        var index = await BuildOrGetChunkIndexAsync(s3, bucket, key, cache);
+        var index = await BuildOrGetChunkIndexAsync(s3, bucket, key, cache, log);
         
         log.LogInformation("SyncInfo: Sucesso - {TotalRegistros} registros, {TotalChunks} chunks", 
             index.TotalRecords, index.Chunks.Count);
@@ -831,7 +831,7 @@ app.MapGet("/api/tombamentos/lote/{id:int}", async (
             return Results.Problem("Bucket não configurado.");
         }
 
-        var index = await BuildOrGetChunkIndexAsync(s3, bucket, key, cache);
+        var index = await BuildOrGetChunkIndexAsync(s3, bucket, key, cache, log);
         
         if (id < 1 || id > index.Chunks.Count)
         {
@@ -1360,81 +1360,90 @@ static async Task<Amazon.S3.Model.GetObjectResponse> GetS3ObjectWithFallback(
     }
 }
 
-static async Task<ChunkIndex> BuildOrGetChunkIndexAsync(IAmazonS3 s3, string bucket, string key, IMemoryCache cache)
+static async Task<ChunkIndex> BuildOrGetChunkIndexAsync(IAmazonS3 s3, string bucket, string key, IMemoryCache cache, ILogger? log = null)
 {
-    var head = await s3.GetObjectMetadataAsync(bucket, key);
-    var dt = head.LastModified ?? DateTime.UtcNow;
-    var version = dt.ToUniversalTime().ToString("yyyyMMddHHmmss");
-    var cacheKey = $"TOMB-INDEX:{bucket}:{key}:{version}";
-    if (cache.TryGetValue<ChunkIndex>(cacheKey, out var cached) && cached is not null) 
-        return cached;
-    
-    var options = new JsonSerializerOptions
+    try
     {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-    };
-    var chunks = new List<ChunkMeta>();
-    var sha256 = SHA256.Create();
-    var globalHashCtx = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-    var total = 0;
-    var current = new List<TombamentoRecord>();
-    
-    // ═══════════════════════════════════════════════════════════════════════════
-    // ESTRATEGIA 1: BATCHING FIXO (RECOMENDADA)
-    // Performance: O(n) - ~10-20 segundos para 42 MB
-    // ═══════════════════════════════════════════════════════════════════════════
-    const int MaxItemsPerChunk = 5000; // Ajuste conforme necessario (5k-10k recomendado)
-    
-    using var obj = await s3.GetObjectAsync(bucket, key);
-    using var stream = obj.ResponseStream;
-    
-    // ⚠️ CORRECAO: Usar await ao inves de .Result e validar null
-    var unifiedData = await JsonSerializer.DeserializeAsync<UnifiedDataRecord>(stream, options);
-    var itens = unifiedData?.Tabelas?.Tombamentos?.ToList();
-    
-    // Validacao critica: se itens for null, retorna index vazio
-    if (itens is null || itens.Count == 0)
-    {
-        Console.WriteLine($"[AVISO] Nenhum tombamento encontrado em {key}");
-        var emptyIndex = new ChunkIndex(version, 0, "", new List<ChunkMeta>(), options);
-        cache.Set(cacheKey, emptyIndex, TimeSpan.FromHours(1));
-        return emptyIndex;
-    }
-
-    // Aplica filtro de exercício fiscal corrente
-    var exercicioCorrente = DateTime.Now.Year;
-    var itensFiltrados = itens
-        .Where(p => p.ExercicioFiscal == exercicioCorrente || p.ExercicioFiscal == 0)
-        .ToList();
-
-    Console.WriteLine($"[INFO] Processando {itens.Count} tombamentos de {key}");
-    Console.WriteLine($"[INFO] Tombamentos filtrados para exercício {exercicioCorrente}: {itensFiltrados.Count}");
-
-    foreach (var item in itensFiltrados)
-    {
-        if (item is null) continue;
-        current.Add(item);
-        total++;
+        var head = await s3.GetObjectMetadataAsync(bucket, key);
+        var dt = head.LastModified ?? DateTime.UtcNow;
+        var version = dt.ToUniversalTime().ToString("yyyyMMddHHmmss");
+        var cacheKey = $"TOMB-INDEX:{bucket}:{key}:{version}";
         
-        // Verifica apenas o tamanho do buffer, nao serializa/comprime a cada item
-        if (current.Count >= MaxItemsPerChunk)
+        if (cache.TryGetValue<ChunkIndex>(cacheKey, out var cached) && cached is not null)
+        {
+            log?.LogInformation("BuildOrGetChunkIndexAsync: Usando index em cache para {Key}", key);
+            return cached;
+        }
+        
+        log?.LogInformation("BuildOrGetChunkIndexAsync: Construindo index para {Key}", key);
+        
+        var options = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        };
+        var chunks = new List<ChunkMeta>();
+        var sha256 = SHA256.Create();
+        var globalHashCtx = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var total = 0;
+        var current = new List<TombamentoRecord>();
+        
+        const int MaxItemsPerChunk = 5000;
+        
+        using var obj = await s3.GetObjectAsync(bucket, key);
+        using var stream = obj.ResponseStream;
+        
+        var unifiedData = await JsonSerializer.DeserializeAsync<UnifiedDataRecord>(stream, options);
+        var itens = unifiedData?.Tabelas?.Tombamentos?.ToList();
+        
+        if (itens is null || itens.Count == 0)
+        {
+            log?.LogWarning("BuildOrGetChunkIndexAsync: Nenhum tombamento encontrado em {Key}", key);
+            var emptyIndex = new ChunkIndex(version, 0, "", new List<ChunkMeta>(), options);
+            cache.Set(cacheKey, emptyIndex, TimeSpan.FromHours(1));
+            return emptyIndex;
+        }
+
+        var exercicioCorrente = DateTime.Now.Year;
+        var itensFiltrados = itens
+            .Where(p => p.ExercicioFiscal == exercicioCorrente || p.ExercicioFiscal == 0)
+            .ToList();
+
+        log?.LogInformation("BuildOrGetChunkIndexAsync: Processando {Total} tombamentos (filtrados: {Filtrados})", 
+            itens.Count, itensFiltrados.Count);
+
+        foreach (var item in itensFiltrados)
+        {
+            if (item is null) continue;
+            current.Add(item);
+            total++;
+            
+            if (current.Count >= MaxItemsPerChunk)
+            {
+                await FinalizeChunkAsync(current, total, sha256, globalHashCtx, chunks, options);
+                current.Clear();
+            }
+        }
+        
+        if (current.Count > 0)
         {
             await FinalizeChunkAsync(current, total, sha256, globalHashCtx, chunks, options);
-            current.Clear();
         }
+        
+        var globalHash = Convert.ToHexString(globalHashCtx.GetHashAndReset());
+        var index = new ChunkIndex(version, total, globalHash, chunks, options);
+        cache.Set(cacheKey, index, TimeSpan.FromHours(1));
+        
+        log?.LogInformation("BuildOrGetChunkIndexAsync: Index construído com sucesso - {Total} registros, {Chunks} chunks", 
+            total, chunks.Count);
+        
+        return index;
     }
-    
-    // Processa o ultimo chunk (se houver registros restantes)
-    if (current.Count > 0)
+    catch (Exception ex)
     {
-        await FinalizeChunkAsync(current, total, sha256, globalHashCtx, chunks, options);
+        log?.LogError(ex, "BuildOrGetChunkIndexAsync: Erro ao construir index para {Key}", key);
+        throw;
     }
-    
-    var globalHash = Convert.ToHexString(globalHashCtx.GetHashAndReset());
-    var index = new ChunkIndex(version, total, globalHash, chunks, options);
-    cache.Set(cacheKey, index, TimeSpan.FromHours(1));
-    return index;
 }
 
 static async Task<ChunkIndex> BuildOrGetChunkIndexFromLocalAsync(string filePath, IMemoryCache cache)
