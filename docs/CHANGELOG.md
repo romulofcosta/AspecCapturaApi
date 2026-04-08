@@ -1,5 +1,22 @@
 # Registro de alterações
 
+## [0.3.3] - 2026-04-08
+
+### 🐛 Correções
+- **Erro de Conversão JSON na Sincronização**: Corrigido erro "The JSON value could not be converted to..." ao baixar lotes de tombamento
+  - Adicionados 3 campos faltantes ao `TombamentoRecord` para compatibilidade com frontend:
+    - `descricao` (string?)
+    - `localizacao` (string?)
+    - `valorestimado` (decimal?)
+  - Campos são nullable para não quebrar dados existentes
+  - Sincronização de lotes agora funciona corretamente após autenticação
+
+### 📚 Documentação
+- **FIX_JSON_CONVERSION_ERROR.md**: Documentação completa do problema e solução aplicada
+  - Análise da incompatibilidade entre estruturas API/Frontend
+  - Comparação detalhada dos campos de `TombamentoRecord` vs `TombamentoWire`
+  - Impacto e próximos passos para validação
+
 ## [0.3.2] - 2026-03-04
 
 ### 🐛 Correções

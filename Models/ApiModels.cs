@@ -116,6 +116,10 @@ public class TombamentoRecord
     [JsonPropertyName("cdarea")] public string CdArea { get; set; } = string.Empty;
     [JsonPropertyName("cdsarea")] public string CdSArea { get; set; } = string.Empty;
     [JsonPropertyName("exerciciofiscal")] public int ExercicioFiscal { get; set; } = 0;  // Ano do exercício fiscal (YYYY); 0 quando ausente
+    // Campos adicionais para compatibilidade com frontend
+    [JsonPropertyName("descricao")] public string? Descricao { get; set; }
+    [JsonPropertyName("localizacao")] public string? Localizacao { get; set; }
+    [JsonPropertyName("valorestimado")] public decimal? ValorEstimado { get; set; }
     // Capture metadata (written on capture, not present in original data)
     [JsonPropertyName("fotoKey")] public string? FotoKey { get; set; }
     [JsonPropertyName("capturedBy")] public string? CapturedBy { get; set; }
