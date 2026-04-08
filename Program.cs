@@ -28,7 +28,7 @@ builder.Logging.AddConsole();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
-    c.SwaggerDoc("v1", new() { Title = "ASPEC Capture API", Version = "v1" });
+    c.SwaggerDoc("v1", new() { Title = "ASPEC Capture API", Version = "0.8.0" });
 });
 
 // ─── AWS ──────────────────────────────────────────────────────────────────────
@@ -53,7 +53,10 @@ builder.Services.AddCors(options =>
             .SetIsOriginAllowed(origin =>
             {
                 if (builder.Environment.IsDevelopment()) return true;
-                return origin.EndsWith(".pwa-camera-poc-blazor.pages.dev");
+                
+                // Permite o domínio principal e subdomínios
+                return origin == "https://pwa-camera-poc-blazor.pages.dev" ||
+                       origin.EndsWith(".pwa-camera-poc-blazor.pages.dev");
             })
             .AllowAnyMethod()
             .AllowAnyHeader()

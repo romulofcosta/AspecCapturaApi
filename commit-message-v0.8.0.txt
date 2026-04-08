@@ -1,0 +1,45 @@
+v0.8.0 - Correção de CORS e adição de versionamento
+
+## 🔧 Correções
+
+### CORS
+- **Configuração corrigida** para aceitar domínio principal do Cloudflare Pages
+  - Adicionado suporte explícito a `https://pwa-camera-poc-blazor.pages.dev`
+  - Mantido suporte a subdomínios (`.pwa-camera-poc-blazor.pages.dev`)
+  - Corrige erro: "Access-Control-Allow-Origin header is not present"
+
+**Antes:**
+```csharp
+return origin.EndsWith(".pwa-camera-poc-blazor.pages.dev");
+```
+
+**Depois:**
+```csharp
+return origin == "https://pwa-camera-poc-blazor.pages.dev" ||
+       origin.EndsWith(".pwa-camera-poc-blazor.pages.dev");
+```
+
+## 🔢 Versionamento
+
+### Adicionado
+- **Propriedades de versão** em `pwa-camera-poc-api.csproj`:
+  - `Version`: 0.8.0
+  - `AssemblyVersion`: 0.8.0.0
+  - `FileVersion`: 0.8.0.0
+  - `InformationalVersion`: 0.8.0
+
+- **Versão no Swagger**: v1 → 0.8.0
+  - Agora exibe versão real da API na documentação
+
+## 🎯 Impacto
+
+- ✅ Frontend (PWA) agora se comunica corretamente com a API
+- ✅ Requisições do Cloudflare Pages não são mais bloqueadas por CORS
+- ✅ API agora tem versionamento adequado
+- ✅ Swagger exibe versão correta da API
+
+## 🔗 Links
+
+- API: https://pwa-camera-poc-api.onrender.com
+- Swagger: https://pwa-camera-poc-api.onrender.com/swagger
+- Health Check: https://pwa-camera-poc-api.onrender.com/health
