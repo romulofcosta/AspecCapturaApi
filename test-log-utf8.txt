@@ -1,3 +1,0 @@
-﻿  Determinando os projetos a serem restaurados...
-  C:\Users\romulo.costa\.gemini\antigravity\scratch\pwa-camera-poc-api\pwa-camera-poc-api.csproj restaurado (em 497 ms).
-

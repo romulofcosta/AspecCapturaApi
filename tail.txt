@@ -1,5 +1,0 @@
-﻿o":   123456789123  },
-            { "dtestr":  20010101, "cdorgao":  "12", "cdunid":  "12", "cdarea":  "001", "cdsarea":  "060", "idlocalizacao":   123456789123  },
-            { "dtestr":  20010101, "cdorgao":  "13", "cdunid":  "13", "cdarea":  "001", "cdsarea":  "065", "idlocalizacao":   123456789123  },
-            { "dtestr":  20010101, "cdorgao":  "14", "cdunid":  "14", "cdarea":  "001", "cdsarea":  "066", "idlocalizacao":   123456789123  },
-            { "dtestr":  20010101, "cdorgao":  "15", "cdunid":  "15", "cdarea":  "001", "cdsarea":  "067", "idlocalizacao":   123456789123  },

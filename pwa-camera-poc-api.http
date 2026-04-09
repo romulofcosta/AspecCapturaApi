@@ -1,6 +1,0 @@
-@pwa_camera_poc_api_HostAddress = http://localhost:5069
-
-GET {{pwa_camera_poc_api_HostAddress}}/weatherforecast/
-Accept: application/json
-
-###

@@ -1,0 +1,22 @@
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*",
+  "AWS": {
+    "Region": "us-east-2",
+    "BucketName": "aspec-capture"
+    // ⚠️  NÃO adicione AccessKey e SecretKey aqui!
+    // Use variáveis de ambiente no arquivo .env
+  },
+  "LocalData": {
+    "Enabled": true,
+    "DefaultFile": "C:\\caminho\\para\\seu\\arquivo.json",
+    "PrefixFiles": {
+      "CE999": "C:\\caminho\\para\\CE999.json"
+    }
+  }
+}

@@ -2,17 +2,25 @@
   "Logging": {
     "LogLevel": {
       "Default": "Information",
-      "Microsoft.AspNetCore": "Warning",
-      "Microsoft.AspNetCore.HttpLogging": "Information"
+      "Microsoft.AspNetCore": "Warning"
     }
   },
   "AllowedHosts": "*",
   "AWS": {
-    "Region": "AWS__Region",
-    "BucketName": "AWS__BucketName",
-    "AccessKey": "AWS__AccessKey",
-    "SecretKey": "AWS__SecretKey"
+    "Region": "us-east-2",
+    "BucketName": "your-bucket-name",
+    "AccessKey": "USE_ENVIRONMENT_VARIABLE_AWS_ACCESS_KEY_ID",
+    "SecretKey": "USE_ENVIRONMENT_VARIABLE_AWS_SECRET_ACCESS_KEY"
   },
+  "LocalData": {
+    "Enabled": false,
+    "DefaultFile": "",
+    "PrefixFiles": {}
+  },
+  "AllowedOrigins": [
+    "https://your-production-domain.com",
+    "https://your-staging-domain.com"
+  ],
   "Security": {
     "JwtSecret": "USE_ENVIRONMENT_VARIABLE_JWT_SECRET",
     "JwtIssuer": "aspec-capture-api",
@@ -21,14 +29,8 @@
     "RefreshTokenExpirationDays": 7
   },
   "RateLimit": {
-    "Enabled": false,
     "GeneralRequestsPerMinute": 60,
     "LoginAttemptsPerFifteenMinutes": 5,
     "CaptureRequestsPerMinute": 30
-  },
-  "Features": {
-    "EnableSwagger": true,
-    "EnableDetailedErrors": true,
-    "EnableRequestLogging": true
   }
 }
