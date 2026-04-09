@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace PwaCameraPocApi.Models;
+namespace AspecCapturaApi.Models;
 
 // ─── DTOs e Records ───────────────────────────────────────────────────────────
 public record PresignedUrlRequest(string FileName, string ContentType, string AssetId, string AssetCode);

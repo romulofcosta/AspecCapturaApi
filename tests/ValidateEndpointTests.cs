@@ -1,9 +1,9 @@
 using FluentAssertions;
-using PwaCameraPocApi.Models;
+using AspecCapturaApi.Models;
 using System.Net;
 using System.Net.Http.Json;
 
-namespace PwaCameraPocApi.Tests;
+namespace AspecCapturaApi.Tests;
 
 public class ValidateEndpointTests : IClassFixture<CaptureTestFactory>
 {

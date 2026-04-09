@@ -20,7 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../pwa-camera-poc-api.csproj" />
+    <ProjectReference Include="../AspecCapturaApi.csproj" />
   </ItemGroup>
 
   <ItemGroup>

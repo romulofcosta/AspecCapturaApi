@@ -1,6 +1,6 @@
 using FluentAssertions;
 
-namespace PwaCameraPocApi.Tests;
+namespace AspecCapturaApi.Tests;
 
 public class BasicTest
 {

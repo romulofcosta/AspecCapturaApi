@@ -3,7 +3,7 @@ using Amazon.S3.Model;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.ResponseCompression;
 using Microsoft.Extensions.Caching.Memory;
-using PwaCameraPocApi.Models;
+using AspecCapturaApi.Models;
 using System.Buffers;
 using System.IO.Compression;
 using System.Runtime.CompilerServices;
@@ -54,9 +54,16 @@ builder.Services.AddCors(options =>
             {
                 if (builder.Environment.IsDevelopment()) return true;
                 
-                // Permite o domínio principal e subdomínios
-                return origin == "https://pwa-camera-poc-blazor.pages.dev" ||
-                       origin.EndsWith(".pwa-camera-poc-blazor.pages.dev");
+                // Permite o domínio principal e todos os subdomínios do Cloudflare Pages
+                // Formato: https://[hash].pwa-camera-poc-blazor.pages.dev ou https://pwa-camera-poc-blazor.pages.dev
+                if (string.IsNullOrEmpty(origin)) return false;
+                
+                var uri = new Uri(origin);
+                var host = uri.Host.ToLowerInvariant();
+                
+                return host == "pwa-camera-poc-blazor.pages.dev" ||
+                       host.EndsWith(".pwa-camera-poc-blazor.pages.dev") ||
+                       host.Contains("pwa-camera-poc-blazor.pages.dev");
             })
             .AllowAnyMethod()
             .AllowAnyHeader()

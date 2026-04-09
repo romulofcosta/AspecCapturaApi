@@ -3,11 +3,11 @@ using Amazon.S3.Model;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Moq;
-using PwaCameraPocApi.Models;
+using AspecCapturaApi.Models;
 using System.Text;
 using System.Text.Json;
 
-namespace PwaCameraPocApi.Tests;
+namespace AspecCapturaApi.Tests;
 
 /// <summary>
 /// Shared WebApplicationFactory with a mocked IAmazonS3 for capture endpoint tests.
