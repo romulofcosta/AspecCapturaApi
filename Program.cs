@@ -97,6 +97,14 @@ builder.Services.AddSingleton<IAmazonS3>(sp =>
 });
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
+// Lê origens permitidas da variável de ambiente ALLOWED_ORIGINS (separadas por vírgula)
+// Fallback: permite qualquer subdomínio *.pages.dev (Cloudflare Pages)
+var allowedOriginsEnv = Environment.GetEnvironmentVariable("ALLOWED_ORIGINS") ?? string.Empty;
+var allowedOriginsList = allowedOriginsEnv
+    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+    .Select(o => o.ToLowerInvariant())
+    .ToHashSet();
+
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowSpecificOrigins", corsBuilder =>
@@ -105,17 +113,17 @@ builder.Services.AddCors(options =>
             .SetIsOriginAllowed(origin =>
             {
                 if (builder.Environment.IsDevelopment()) return true;
-                
-                // Permite o domínio principal e todos os subdomínios do Cloudflare Pages
-                // Formato: https://[hash].pwa-camera-poc-blazor.pages.dev ou https://pwa-camera-poc-blazor.pages.dev
                 if (string.IsNullOrEmpty(origin)) return false;
-                
-                var uri = new Uri(origin);
-                var host = uri.Host.ToLowerInvariant();
-                
-                return host == "pwa-camera-poc-blazor.pages.dev" ||
-                       host.EndsWith(".pwa-camera-poc-blazor.pages.dev") ||
-                       host.Contains("pwa-camera-poc-blazor.pages.dev");
+
+                var host = new Uri(origin).Host.ToLowerInvariant();
+
+                // 1. Verifica lista explícita da variável ALLOWED_ORIGINS
+                if (allowedOriginsList.Count > 0)
+                    return allowedOriginsList.Any(allowed =>
+                        host == allowed || host.EndsWith("." + allowed));
+
+                // 2. Fallback: qualquer subdomínio Cloudflare Pages (*.pages.dev)
+                return host.EndsWith(".pages.dev") || host == "pages.dev";
             })
             .AllowAnyMethod()
             .AllowAnyHeader()
