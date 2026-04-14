@@ -37,6 +37,26 @@ Exemplos do histórico:
 
 Nunca commitar sem versionar. O feedback visual da versão na tela de login é obrigatório.
 
+## Mantra de Qualidade — Build e Testes
+
+**Obrigatório após qualquer alteração de código:**
+1. Rodar build e testes automatizados
+2. Reportar resultado antes de pedir teste manual ao usuário
+3. Repetir antes de qualquer commit
+
+### AspecCapturaApi
+```
+dotnet build AspecCapturaApi.csproj -c Release
+dotnet build tests/Tests.csproj -c Release
+dotnet test tests/Tests.csproj -c Release --no-build
+```
+
+### AspecCaptura
+```
+dotnet build AspecCaptura.csproj -c Release
+# (requer wasm-tools com admin — se falhar NETSDK1147, é limitação local, validar no CI)
+```
+
 ## Build e Testes (pré-commit)
 
 ### AspecCapturaApi

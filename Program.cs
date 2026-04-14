@@ -71,7 +71,7 @@ builder.Logging.AddConsole();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
-    c.SwaggerDoc("v1", new() { Title = "ASPEC Capture API", Version = "0.11.1" });
+    c.SwaggerDoc("v1", new() { Title = "ASPEC Capture API", Version = "0.11.2" });
 });
 
 // ─── AWS ──────────────────────────────────────────────────────────────────────
