@@ -22,13 +22,25 @@ using System.Security.Claims;
 // ─── Carregar variáveis de ambiente do arquivo .env ───────────────────────────
 EnvironmentHelper.LoadDotEnv();
 
-// ─── Mapear variáveis .env para o formato AWS__ do ASP.NET Core ───────────────
+// ─── Mapear variáveis de ambiente em ambas as direções ────────────────────────
+// Suporta tanto AWS_BUCKET_NAME (formato .env) quanto AWS__BucketName (formato Render/ASP.NET Core)
 void MapEnvToAspNet(string envKey, string aspNetKey)
 {
     var val = Environment.GetEnvironmentVariable(envKey);
     if (!string.IsNullOrEmpty(val))
         Environment.SetEnvironmentVariable(aspNetKey, val);
 }
+void MapAspNetToEnv(string aspNetKey, string envKey)
+{
+    // Se a variável .env não existe mas a ASP.NET Core sim, popula a .env
+    if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable(envKey)))
+    {
+        var val = Environment.GetEnvironmentVariable(aspNetKey);
+        if (!string.IsNullOrEmpty(val))
+            Environment.SetEnvironmentVariable(envKey, val);
+    }
+}
+// .env → ASP.NET Core
 MapEnvToAspNet("AWS_REGION",            "AWS__Region");
 MapEnvToAspNet("AWS_BUCKET_NAME",       "AWS__BucketName");
 MapEnvToAspNet("AWS_ACCESS_KEY_ID",     "AWS__AccessKey");
@@ -37,6 +49,11 @@ MapEnvToAspNet("JWT_SECRET",            "Security__JwtSecret");
 MapEnvToAspNet("JWT_ISSUER",            "Security__JwtIssuer");
 MapEnvToAspNet("JWT_AUDIENCE",          "Security__JwtAudience");
 MapEnvToAspNet("JWT_EXPIRATION_MINUTES","Security__JwtExpirationMinutes");
+// ASP.NET Core (Render) → .env (para código que lê GetEnvironmentVariable diretamente)
+MapAspNetToEnv("AWS__Region",     "AWS_REGION");
+MapAspNetToEnv("AWS__BucketName", "AWS_BUCKET_NAME");
+MapAspNetToEnv("AWS__AccessKey",  "AWS_ACCESS_KEY_ID");
+MapAspNetToEnv("AWS__SecretKey",  "AWS_SECRET_ACCESS_KEY");
 
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions
 {
