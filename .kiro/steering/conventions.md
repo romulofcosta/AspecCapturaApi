@@ -55,6 +55,12 @@ Nunca commitar sem versionar. O feedback visual da versão na tela de login é o
 - Não é e-mail — o placeholder deve refletir isso: `municipio.nome.sobrenome`
 - A API valida que o prefixo do token JWT bate com o prefixo da requisição (segurança por município)
 
+## Dockerfile
+
+- O `Dockerfile` referencia `AspecCapturaApi.csproj` e `AspecCapturaApi.dll` (nome atual)
+- Nome antigo `pwa-camera-poc-api` foi descontinuado — nunca usar em novos arquivos
+- Se o projeto for renomeado novamente, atualizar: `COPY`, `RUN dotnet restore`, `RUN dotnet build`, `RUN dotnet publish`, e `ENTRYPOINT`
+
 ## Testes — Autenticação
 
 - Os testes de integração usam `CaptureTestFactory.CreateAuthenticatedClient()`
