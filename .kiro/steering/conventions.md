@@ -55,6 +55,41 @@ Nunca commitar sem versionar. O feedback visual da versão na tela de login é o
 - Não é e-mail — o placeholder deve refletir isso: `municipio.nome.sobrenome`
 - A API valida que o prefixo do token JWT bate com o prefixo da requisição (segurança por município)
 
+## Princípios de Código
+
+Todo código novo ou refatorado deve seguir esses princípios. São critérios de revisão obrigatórios antes de qualquer commit.
+
+- **KISS** (Keep It Simple, Stupid): prefira a solução mais simples que resolve o problema. Complexidade só quando necessária.
+- **DRY** (Don't Repeat Yourself): lógica duplicada vira função/serviço. Se copiou e colou, algo está errado.
+- **YAGNI** (You Aren't Gonna Need It): não implemente o que não é necessário agora. Evite abstrações prematuras.
+- **Clean Code**: nomes descritivos, funções pequenas com responsabilidade única, sem comentários óbvios, sem código morto.
+- **SOLID**:
+  - *Single Responsibility*: cada classe/serviço faz uma coisa só
+  - *Open/Closed*: aberto para extensão, fechado para modificação
+  - *Liskov Substitution*: subtipos substituem o tipo base sem quebrar comportamento
+  - *Interface Segregation*: interfaces pequenas e específicas
+  - *Dependency Inversion*: dependa de abstrações, não de implementações concretas
+
+## Débito Técnico Conhecido
+
+### Variáveis de Ambiente — Simplificação Pendente
+
+Atualmente o projeto mantém dois formatos paralelos de variáveis AWS:
+- `AWS__BucketName` (formato ASP.NET Core / Render)
+- `AWS_BUCKET_NAME` (formato .env / código legado)
+
+Isso viola DRY e aumenta superfície de erro. O mapeamento bidirecional em `Program.cs` é um workaround temporário.
+
+**Plano de simplificação (próxima versão):**
+1. Padronizar tudo no formato `AWS__*` (ASP.NET Core nativo via `IConfiguration`)
+2. Remover todas as chamadas diretas a `Environment.GetEnvironmentVariable("AWS_*")`
+3. Injetar `IConfiguration` nos endpoints que precisam de bucket/region
+4. Remover o bloco `MapAspNetToEnv` do `Program.cs`
+5. No Render: manter apenas `AWS__BucketName`, `AWS__Region`, `AWS__AccessKey`, `AWS__SecretKey`
+6. No `.env` local: usar o mesmo formato `AWS__*`
+
+Resultado: uma única fonte de verdade via `IConfiguration`, sem mapeamento manual.
+
 ## Dockerfile
 
 - O `Dockerfile` referencia `AspecCapturaApi.csproj` e `AspecCapturaApi.dll` (nome atual)
