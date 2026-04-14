@@ -13,7 +13,7 @@ public class SyncEndpointTests : IClassFixture<CaptureTestFactory>
     public SyncEndpointTests(CaptureTestFactory factory)
     {
         _factory = factory;
-        _client = factory.CreateClient();
+        _client = factory.CreateAuthenticatedClient();
     }
 
     [Fact]
@@ -83,6 +83,8 @@ public class SyncEndpointTests : IClassFixture<CaptureTestFactory>
     [Fact]
     public async Task SyncBatch_Returns404_WhenPrefixoNotFound()
     {
+        // Quando o prefixo não bate com o token JWT, a API retorna 403 (autorização negada)
+        // antes mesmo de consultar o S3. Esse é o comportamento correto de segurança.
         var request = new SyncBatchRequest(
             Prefixo: "INVALID",
             Items: new List<CaptureItemRequest>
@@ -95,6 +97,6 @@ public class SyncEndpointTests : IClassFixture<CaptureTestFactory>
 
         var response = await _client.PostAsJsonAsync("/api/capture/sync", request);
 
-        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
     }
 }

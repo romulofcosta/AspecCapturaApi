@@ -6,6 +6,9 @@ using Moq;
 using AspecCapturaApi.Models;
 using System.Text;
 using System.Text.Json;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using Microsoft.IdentityModel.Tokens;
 
 namespace AspecCapturaApi.Tests;
 
@@ -14,6 +17,8 @@ namespace AspecCapturaApi.Tests;
 /// </summary>
 public class CaptureTestFactory : WebApplicationFactory<Program>
 {
+    public const string TestJwtSecret = "test-secret-key-for-unit-tests-only-32chars!";
+
     public Mock<IAmazonS3> S3Mock { get; } = new Mock<IAmazonS3>();
 
     // The in-memory JSON document that S3 mock will serve/store
@@ -35,12 +40,48 @@ public class CaptureTestFactory : WebApplicationFactory<Program>
         builder.UseSetting("AWS:BucketName", "test-bucket");
         builder.UseSetting("AWS:Region", "us-east-1");
         builder.UseSetting("ASPNETCORE_ENVIRONMENT", "Development");
+        builder.UseSetting("Security:JwtSecret", "test-secret-key-for-unit-tests-only-32chars!");
+        builder.UseSetting("Security:JwtIssuer", "aspec-capture-api");
+        builder.UseSetting("Security:JwtAudience", "aspec-capture-client");
+
+        // Garante que as variáveis de ambiente necessárias estejam disponíveis para o Program.cs
+        Environment.SetEnvironmentVariable("JWT_SECRET", "test-secret-key-for-unit-tests-only-32chars!");
+        Environment.SetEnvironmentVariable("JWT_ISSUER", "aspec-capture-api");
+        Environment.SetEnvironmentVariable("JWT_AUDIENCE", "aspec-capture-client");
+        Environment.SetEnvironmentVariable("AWS_BUCKET_NAME", "test-bucket");
+        Environment.SetEnvironmentVariable("AWS_REGION", "us-east-1");
 
         SetupS3Mock();
     }
 
-    public void SetupS3Mock()
+    /// <summary>
+    /// Cria um HttpClient com JWT válido no header Authorization para testes de endpoints protegidos.
+    /// </summary>
+    public HttpClient CreateAuthenticatedClient(string username = "ce999.admin", string prefix = "CE999", string esfera = "E")
     {
+        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(TestJwtSecret));
+        var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+        var token = new JwtSecurityToken(
+            issuer: "aspec-capture-api",
+            audience: "aspec-capture-client",
+            claims: new[]
+            {
+                new Claim(ClaimTypes.NameIdentifier, "test-user-id"),
+                new Claim(ClaimTypes.Name, username),
+                new Claim("prefix", prefix),
+                new Claim("esfera", esfera)
+            },
+            expires: DateTime.UtcNow.AddHours(1),
+            signingCredentials: creds
+        );
+        var tokenString = new JwtSecurityTokenHandler().WriteToken(token);
+        var client = CreateClient();
+        client.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", tokenString);
+        return client;
+    }
+
+    public void SetupS3Mock()    {
         var options = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,

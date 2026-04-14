@@ -13,7 +13,7 @@ public class ValidateEndpointTests : IClassFixture<CaptureTestFactory>
     public ValidateEndpointTests(CaptureTestFactory factory)
     {
         _factory = factory;
-        _client = factory.CreateClient();
+        _client = factory.CreateAuthenticatedClient();
     }
 
     [Fact]

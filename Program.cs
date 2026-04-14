@@ -22,6 +22,22 @@ using System.Security.Claims;
 // ─── Carregar variáveis de ambiente do arquivo .env ───────────────────────────
 EnvironmentHelper.LoadDotEnv();
 
+// ─── Mapear variáveis .env para o formato AWS__ do ASP.NET Core ───────────────
+void MapEnvToAspNet(string envKey, string aspNetKey)
+{
+    var val = Environment.GetEnvironmentVariable(envKey);
+    if (!string.IsNullOrEmpty(val))
+        Environment.SetEnvironmentVariable(aspNetKey, val);
+}
+MapEnvToAspNet("AWS_REGION",            "AWS__Region");
+MapEnvToAspNet("AWS_BUCKET_NAME",       "AWS__BucketName");
+MapEnvToAspNet("AWS_ACCESS_KEY_ID",     "AWS__AccessKey");
+MapEnvToAspNet("AWS_SECRET_ACCESS_KEY", "AWS__SecretKey");
+MapEnvToAspNet("JWT_SECRET",            "Security__JwtSecret");
+MapEnvToAspNet("JWT_ISSUER",            "Security__JwtIssuer");
+MapEnvToAspNet("JWT_AUDIENCE",          "Security__JwtAudience");
+MapEnvToAspNet("JWT_EXPIRATION_MINUTES","Security__JwtExpirationMinutes");
+
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions
 {
     Args = args,
@@ -38,7 +54,7 @@ builder.Logging.AddConsole();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
-    c.SwaggerDoc("v1", new() { Title = "ASPEC Capture API", Version = "0.8.0" });
+    c.SwaggerDoc("v1", new() { Title = "ASPEC Capture API", Version = "0.11.1" });
 });
 
 // ─── AWS ──────────────────────────────────────────────────────────────────────
@@ -63,7 +79,22 @@ else
 }
 
 builder.Services.AddDefaultAWSOptions(awsOptions);
-builder.Services.AddAWSService<IAmazonS3>();
+builder.Services.AddSingleton<IAmazonS3>(sp =>
+{
+    var config = new Amazon.S3.AmazonS3Config
+    {
+        RegionEndpoint = Amazon.RegionEndpoint.GetBySystemName(
+            Environment.GetEnvironmentVariable("AWS_REGION") ?? "us-east-2"),
+        Timeout = TimeSpan.FromSeconds(60),
+        MaxErrorRetry = 2,
+        UseAccelerateEndpoint = true  // Roteia via edge location mais próxima (reduz latência Brasil→Ohio)
+    };
+    var credentials = new Amazon.Runtime.BasicAWSCredentials(
+        Environment.GetEnvironmentVariable("AWS_ACCESS_KEY_ID") ?? builder.Configuration["AWS:AccessKey"],
+        Environment.GetEnvironmentVariable("AWS_SECRET_ACCESS_KEY") ?? builder.Configuration["AWS:SecretKey"]
+    );
+    return new Amazon.S3.AmazonS3Client(credentials, config);
+});
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 builder.Services.AddCors(options =>
@@ -99,7 +130,8 @@ var jsonOptions = new JsonSerializerOptions
     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     AllowTrailingCommas = true,
-    ReadCommentHandling = JsonCommentHandling.Skip
+    ReadCommentHandling = JsonCommentHandling.Skip,
+    NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString
 };
 
 builder.Services.AddResponseCompression(options =>
@@ -383,16 +415,15 @@ app.MapGet("/api/tombamentos/localizacoes", async (
             return Results.Problem("Bucket não configurado.");
 
         var head = await s3.GetObjectMetadataAsync(bucket, key);
-        var dt = head.LastModified ?? DateTime.UtcNow;
-        var ver = dt.ToUniversalTime().ToString("yyyyMMddHHmmss");
+        var ver = (head.LastModified ?? DateTime.UtcNow).ToUniversalTime().ToString("yyyyMMddHHmmss");
         var cacheKey = $"TOMB-LOC:{bucket}:{key}:{ver}";
 
         if (!cache.TryGetValue(cacheKey, out List<object>? cached))
         {
-            using var obj = await s3.GetObjectAsync(bucket, key);
-            using var stream = obj.ResponseStream;
-            var unified = await JsonSerializer.DeserializeAsync<UnifiedDataRecord>(stream, jsonOptions);
-            var locs = unified?.Tabelas?.Localizacao ?? new List<LocalizacaoRecord>();
+            // Usa GetOrLoadUnifiedDataAsync — reutiliza cache TOMB-DATA se já existir
+            var unified = await GetOrLoadUnifiedDataAsync(s3, bucket, key, ver, cache, jsonOptions, log);
+
+            var locs = unified.Tabelas?.Localizacao ?? new List<LocalizacaoRecord>();
             var best = locs
                 .GroupBy(l => l.IdLocalizacao)
                 .Select(g => g
@@ -436,6 +467,7 @@ app.MapPost("/api/auth/login", async (
     [FromBody] LoginRequest request,
     [FromServices] IAmazonS3 s3Client,
     [FromServices] IConfiguration configuration,
+    [FromServices] IAuthService authService,
     [FromServices] IWebHostEnvironment env,
     ILogger<Program> log) =>
 {
@@ -462,15 +494,31 @@ app.MapPost("/api/auth/login", async (
     try
     {
         // Carrega dados de usuário do S3
-        var bucketName = configuration["AWS:BucketName"];
-        if (string.IsNullOrEmpty(bucketName))
+        var bucketName = Environment.GetEnvironmentVariable("AWS_BUCKET_NAME")
+            ?? configuration["AWS:BucketName"];
+        if (string.IsNullOrEmpty(bucketName) || bucketName == "AWS__BucketName")
             return Results.Problem("Bucket não configurado.");
 
+        log.LogInformation("Buscando arquivo S3: {S3Key} no bucket {Bucket}", s3Key, bucketName);
         using Amazon.S3.Model.GetObjectResponse s3Response = await GetS3ObjectWithFallback(s3Client, bucketName, s3Key, s3KeyLower, log);
+        log.LogInformation("Arquivo S3 carregado com sucesso: {S3Key}", s3Key);
 
-        using var responseStream = s3Response.ResponseStream;
-        using var reader = new StreamReader(responseStream);
-        var json = await reader.ReadToEndAsync();
+        // Copia o stream S3 para MemoryStream antes de fechar o response
+        // Evita travamento em streams de rede que ficam pendentes durante leitura longa
+        byte[] rawBytes;
+        using (var responseStream = s3Response.ResponseStream)
+        {
+            using var ms = new MemoryStream();
+            await responseStream.CopyToAsync(ms);
+            rawBytes = ms.ToArray();
+        }
+        log.LogInformation("Login: {S3Key} lido ({Bytes} bytes)", s3Key, rawBytes.Length);
+
+        // Decodifica com fallback tolerante para bytes inválidos (encoding legado Harbour)
+        var tolerantEncoding = Encoding.GetEncoding("UTF-8",
+            EncoderFallback.ReplacementFallback,
+            DecoderFallback.ReplacementFallback);
+        var json = tolerantEncoding.GetString(rawBytes);
         var root = JsonSerializer.Deserialize<UnifiedDataRecord>(json, jsonOptions);
 
         if (root?.Usuarios == null || root.Usuarios.Count == 0)
@@ -489,8 +537,6 @@ app.MapPost("/api/auth/login", async (
         }
         
         // ─── SECURITY: Validar senha usando AuthService ──────────────────────────
-        var authService = app.Services.GetRequiredService<IAuthService>();
-        
         if (!authService.ValidatePassword(senha, user.PwdUsuario))
         {
             log.LogWarning("Authentication failed for user '{Usuario}' from municipality {Prefix}", usuario, prefix);
@@ -695,7 +741,12 @@ app.MapGet("/api/tombamentos/lote/{id:int}", async (
         if (!cache.TryGetValue<byte[]>(cacheKey, out var payload))
         {
             log.LogInformation("Lote: Gerando payload para chunk {ChunkId}", id);
-            payload = await SerializeChunkPayloadAsync(s3, bucket, key, chunkMeta, index.Options);
+            // Obtém o UnifiedDataRecord do cache (ou S3 se não estiver em cache)
+            // BuildOrGetChunkIndexAsync já garantiu que a versão está disponível
+            var head = await s3.GetObjectMetadataAsync(bucket, key);
+            var version2 = (head.LastModified ?? DateTime.UtcNow).ToUniversalTime().ToString("yyyyMMddHHmmss");
+            var unifiedData = await GetOrLoadUnifiedDataAsync(s3, bucket, key, version2, cache, index.Options, log);
+            payload = await SerializeChunkPayloadAsync(unifiedData, chunkMeta, index.Options);
             cache.Set(cacheKey, payload, TimeSpan.FromHours(1));
         }
         else
@@ -822,10 +873,8 @@ app.MapPost("/api/capture/item",
             ContentType = "application/json"
         });
 
-        // 5. Invalidar cache do chunk index
-        var cacheKey = $"TOMB-INDEX:{bucket}:{s3Key}:";
-        // Remove todas as entradas de cache que começam com esse prefixo (versão simples)
-        cache.Remove(cacheKey);
+        // 5. Invalidar cache do chunk index e dados do município
+        await InvalidateCacheForPrefixAsync(s3, bucket, s3Key, cache, log);
 
         return Results.Ok(new CaptureItemResponse(
             IdPatomb: existing.IdPatomb,
@@ -1123,8 +1172,8 @@ app.MapPost("/api/capture/sync",
             ContentType = "application/json"
         });
 
-        // 4. Invalidar cache
-        cache.Remove($"TOMB-INDEX:{bucket}:{s3Key}:");
+        // 4. Invalidar cache do chunk index e dados do município
+        await InvalidateCacheForPrefixAsync(s3, bucket, s3Key, cache, log);
 
         log.LogInformation("Sync batch: {Updated} atualizados, {Created} criados, {Failed} falhas",
             updated, created, failed);
@@ -1160,6 +1209,28 @@ static List<OrgaoRecord> BuildOrgaoHierarchy(
     List<TombamentoRecord> filteredTombamento,
     TabelasRecord tabelas)
 {
+    // Pré-indexa tabelas em dicionários para evitar O(n²) com FirstOrDefault em listas grandes
+    var orgaoPorChave = tabelas.XxOrga
+        .GroupBy(o => (o.DtEstr, o.CdOrgao))
+        .ToDictionary(g => g.Key, g => g.First());
+
+    var unidPorChave = tabelas.XxUnid
+        .GroupBy(u => (u.CdOrgao, u.CdUnid))
+        .ToDictionary(g => g.Key, g => g.First());
+
+    var areaPorCodigo = tabelas.PaArea
+        .GroupBy(a => a.CdArea)
+        .ToDictionary(g => g.Key, g => g.First());
+
+    var subareaPorCodigo = tabelas.PasArea
+        .GroupBy(s => s.CdSArea)
+        .ToDictionary(g => g.Key, g => g.First());
+
+    // Localização indexada por (CdOrgao, CdUnid) para lookup rápido
+    var locPorOrgaoUnid = tabelas.Localizacao
+        .GroupBy(l => (l.CdOrgao, l.CdUnid))
+        .ToDictionary(g => g.Key, g => g.ToList());
+
     var orgaos = new List<OrgaoRecord>();
 
     var targetOrgaoKeys = esfera == "A"
@@ -1173,8 +1244,7 @@ static List<OrgaoRecord> BuildOrgaoHierarchy(
 
     foreach (var (dtEstr, orgCode) in targetOrgaoKeys)
     {
-        var orgInfo = tabelas.XxOrga.FirstOrDefault(o => o.DtEstr == dtEstr && o.CdOrgao == orgCode);
-        if (orgInfo is null) continue;
+        if (!orgaoPorChave.TryGetValue((dtEstr, orgCode), out var orgInfo)) continue;
 
         var targetUoCodes = esfera == "A"
             ? tabelas.XxUnid.Where(u => u.CdOrgao == orgCode).Select(u => u.CdUnid).Distinct()
@@ -1183,12 +1253,11 @@ static List<OrgaoRecord> BuildOrgaoHierarchy(
         var uos = new List<UnidadeOrcamentariaRecord>();
         foreach (var uoCode in targetUoCodes)
         {
-            var uoInfo = tabelas.XxUnid.FirstOrDefault(u => u.CdOrgao == orgCode && u.CdUnid == uoCode);
-            if (uoInfo is null) continue;
+            if (!unidPorChave.TryGetValue((orgCode, uoCode), out var uoInfo)) continue;
 
-            var locs = tabelas.Localizacao
-                .Where(l => l.CdOrgao == orgCode && l.CdUnid == uoCode)
-                .ToList();
+            var locs = locPorOrgaoUnid.TryGetValue((orgCode, uoCode), out var locList)
+                ? locList
+                : new List<LocalizacaoRecord>();
 
             var targetAreaCodes = esfera == "A"
                 ? locs.Select(l => l.CdArea).Distinct()
@@ -1199,8 +1268,7 @@ static List<OrgaoRecord> BuildOrgaoHierarchy(
             var areas = new List<AreaRecord>();
             foreach (var areaCode in targetAreaCodes)
             {
-                var areaInfo = tabelas.PaArea.FirstOrDefault(a => a.CdArea == areaCode);
-                if (areaInfo is null) continue;
+                if (!areaPorCodigo.TryGetValue(areaCode, out var areaInfo)) continue;
 
                 var targetSubCodes = esfera == "A"
                     ? locs.Where(l => l.CdArea == areaCode).Select(l => l.CdSArea).Distinct()
@@ -1211,8 +1279,7 @@ static List<OrgaoRecord> BuildOrgaoHierarchy(
                 var subareas = new List<SubareaRecord>();
                 foreach (var subCode in targetSubCodes)
                 {
-                    var subInfo = tabelas.PasArea.FirstOrDefault(s => s.CdSArea == subCode);
-                    if (subInfo is null) continue;
+                    if (!subareaPorCodigo.TryGetValue(subCode, out var subInfo)) continue;
                     subareas.Add(new SubareaRecord(subCode, subInfo.NmSArea));
                 }
 
@@ -1246,6 +1313,88 @@ static async Task<Amazon.S3.Model.GetObjectResponse> GetS3ObjectWithFallback(
     }
 }
 
+// ─── FUNÇÃO AUXILIAR: CARREGA E CACHEIA UnifiedDataRecord ────────────────────
+/// <summary>
+/// Única fonte de verdade para carregar o arquivo JSON do município do S3.
+/// Cacheia o UnifiedDataRecord deserializado por 1 hora, eliminando downloads
+/// repetidos para o mesmo arquivo durante a sessão de sincronização.
+/// Chave de cache: TOMB-DATA:{bucket}:{key}:{version}
+/// </summary>
+static async Task<UnifiedDataRecord> GetOrLoadUnifiedDataAsync(
+    IAmazonS3 s3, string bucket, string key, string version,
+    IMemoryCache cache, JsonSerializerOptions options, ILogger? log = null)
+{
+    var cacheKey = $"TOMB-DATA:{bucket}:{key}:{version}";
+
+    if (cache.TryGetValue(cacheKey, out UnifiedDataRecord? cached) && cached is not null)
+    {
+        log?.LogInformation("GetOrLoadUnifiedDataAsync: Cache hit para {Key} (versão {Version})", key, version);
+        return cached;
+    }
+
+    log?.LogInformation("GetOrLoadUnifiedDataAsync: Baixando {Key} do S3 (versão {Version})", key, version);
+
+    using var obj = await s3.GetObjectAsync(bucket, key);
+    // Copia para MemoryStream antes de fechar o response — evita travamento em streams de rede longos
+    byte[] rawBytes;
+    using (var s3Stream = obj.ResponseStream)
+    {
+        using var ms = new MemoryStream();
+        await s3Stream.CopyToAsync(ms);
+        rawBytes = ms.ToArray();
+    }
+    var tolerantEncoding = Encoding.GetEncoding("UTF-8",
+        EncoderFallback.ReplacementFallback,
+        DecoderFallback.ReplacementFallback);
+    var json = tolerantEncoding.GetString(rawBytes);
+    var data = JsonSerializer.Deserialize<UnifiedDataRecord>(json, options)
+               ?? throw new InvalidOperationException($"Arquivo inválido ou vazio: {key}");
+
+    cache.Set(cacheKey, data, TimeSpan.FromHours(1));
+
+    log?.LogInformation("GetOrLoadUnifiedDataAsync: {Key} carregado e cacheado ({Tombamentos} tombamentos)",
+        key, data.Tabelas?.Tombamentos?.Count ?? 0);
+
+    return data;
+}
+
+// ─── FUNÇÃO AUXILIAR: INVALIDA CACHE APÓS CAPTURA ────────────────────────────
+/// <summary>
+/// Remove as entradas de cache TOMB-INDEX e TOMB-DATA para o arquivo do município
+/// após uma captura bem-sucedida (PutObjectAsync). Os chunks (TOMB-CHUNK) da versão
+/// anterior expirarão naturalmente em 1 hora — o novo TOMB-INDEX gerado na próxima
+/// requisição usará uma versão diferente, tornando as chaves antigas inacessíveis.
+/// </summary>
+static async Task InvalidateCacheForPrefixAsync(
+    IAmazonS3 s3, string bucket, string s3Key,
+    IMemoryCache cache, ILogger log)
+{
+    try
+    {
+        var head = await s3.GetObjectMetadataAsync(bucket, s3Key);
+        var version = (head.LastModified ?? DateTime.UtcNow)
+                        .ToUniversalTime().ToString("yyyyMMddHHmmss");
+
+        var keysToRemove = new[]
+        {
+            $"TOMB-INDEX:{bucket}:{s3Key}:{version}",
+            $"TOMB-DATA:{bucket}:{s3Key}:{version}",
+        };
+
+        foreach (var k in keysToRemove)
+            cache.Remove(k);
+
+        log.LogInformation(
+            "Cache invalidado para {S3Key}: {Count} entradas removidas (versão {Version})",
+            s3Key, keysToRemove.Length, version);
+    }
+    catch (Exception ex)
+    {
+        // Falha na invalidação não deve bloquear a resposta ao cliente
+        log.LogWarning(ex, "Falha ao invalidar cache para {S3Key}: {Message}", s3Key, ex.Message);
+    }
+}
+
 static async Task<ChunkIndex> BuildOrGetChunkIndexAsync(IAmazonS3 s3, string bucket, string key, IMemoryCache cache, ILogger? log = null)
 {
     try
@@ -1276,11 +1425,8 @@ static async Task<ChunkIndex> BuildOrGetChunkIndexAsync(IAmazonS3 s3, string buc
         
         const int MaxItemsPerChunk = 5000;
         
-        using var obj = await s3.GetObjectAsync(bucket, key);
-        using var stream = obj.ResponseStream;
-        
-        var unifiedData = await JsonSerializer.DeserializeAsync<UnifiedDataRecord>(stream, options);
-        var itens = unifiedData?.Tabelas?.Tombamentos?.ToList();
+        var unifiedData = await GetOrLoadUnifiedDataAsync(s3, bucket, key, version, cache, options, log);
+        var itens = unifiedData.Tabelas?.Tombamentos?.ToList();
         
         if (itens is null || itens.Count == 0)
         {
@@ -1420,7 +1566,7 @@ static async Task<bool> ExceedsTargetAsync(List<TombamentoRecord> buffer, int ta
 }
 */
 
-static async Task<byte[]> SerializeChunkPayloadAsync(IAmazonS3 s3, string bucket, string key, ChunkMeta meta, JsonSerializerOptions options)
+static Task<byte[]> SerializeChunkPayloadAsync(UnifiedDataRecord data, ChunkMeta meta, JsonSerializerOptions options)
 {
     var result = new
     {
@@ -1428,42 +1574,35 @@ static async Task<byte[]> SerializeChunkPayloadAsync(IAmazonS3 s3, string bucket
         data = new List<TombamentoRecord>(meta.Count),
         hash = meta.Hash
     };
-    
-    using var obj = await s3.GetObjectAsync(bucket, key);
-    using var stream = obj.ResponseStream;
-    
-    // ⚠️ CORRECAO: Usar UnifiedDataRecord ao inves de DeserializeAsyncEnumerable
-    var unifiedData = await JsonSerializer.DeserializeAsync<UnifiedDataRecord>(stream, options);
-    var allItems = unifiedData?.Tabelas?.Tombamentos?.ToList();
-    
+
+    var allItems = data.Tabelas?.Tombamentos?.ToList();
+
     if (allItems is null || allItems.Count == 0)
     {
-        Console.WriteLine($"[AVISO] SerializeChunkPayload: Nenhum tombamento encontrado em {key}");
-        return JsonSerializer.SerializeToUtf8Bytes(result, options);
+        Console.WriteLine($"[AVISO] SerializeChunkPayload: Nenhum tombamento encontrado");
+        return Task.FromResult(JsonSerializer.SerializeToUtf8Bytes(result, options));
     }
-    
+
     // Aplica filtro de exercício fiscal corrente
     var exercicioCorrente = DateTime.Now.Year;
     var itemsFiltrados = allItems
         .Where(p => p.ExercicioFiscal == exercicioCorrente || p.ExercicioFiscal == 0)
         .ToList();
-    
+
     var start = meta.Start;
     var end = meta.Start + meta.Count - 1;
-    
+
     // Extrai apenas os itens do chunk especificado
     for (int i = start - 1; i < end && i < itemsFiltrados.Count; i++)
     {
         var item = itemsFiltrados[i];
         if (item is not null)
-        {
             result.data.Add(item);
-        }
     }
-    
+
     Console.WriteLine($"[INFO] SerializeChunkPayload: Chunk {result.chunkId} com {result.data.Count} registros");
-    
-    return JsonSerializer.SerializeToUtf8Bytes(result, options);
+
+    return Task.FromResult(JsonSerializer.SerializeToUtf8Bytes(result, options));
 }
 
 // Required for WebApplicationFactory<Program> in integration tests

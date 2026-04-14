@@ -13,7 +13,7 @@ public class CaptureEndpointTests : IClassFixture<CaptureTestFactory>
     public CaptureEndpointTests(CaptureTestFactory factory)
     {
         _factory = factory;
-        _client = factory.CreateClient();
+        _client = factory.CreateAuthenticatedClient();
     }
 
     // ─── POST /api/capture/item ───────────────────────────────────────────────
@@ -94,6 +94,8 @@ public class CaptureEndpointTests : IClassFixture<CaptureTestFactory>
     [Fact]
     public async Task PostCaptureItem_Returns404_WhenPrefixoNotFound()
     {
+        // Quando o prefixo não bate com o token JWT, a API retorna 403 (autorização negada)
+        // antes mesmo de consultar o S3. Esse é o comportamento correto de segurança.
         var request = new CaptureItemRequest(
             Prefixo: "INVALID",
             IdPatomb: 1L,
@@ -104,7 +106,7 @@ public class CaptureEndpointTests : IClassFixture<CaptureTestFactory>
 
         var response = await _client.PostAsJsonAsync("/api/capture/item", request);
 
-        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
     }
 
     [Fact]
