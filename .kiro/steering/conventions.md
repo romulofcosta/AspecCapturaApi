@@ -55,6 +55,20 @@ Nunca commitar sem versionar. O feedback visual da versão na tela de login é o
 - Não é e-mail — o placeholder deve refletir isso: `municipio.nome.sobrenome`
 - A API valida que o prefixo do token JWT bate com o prefixo da requisição (segurança por município)
 
+## Regras de Negócio — Scan e Localização
+
+### Comportamento do Scan (intencional)
+- O scan **não filtra** por área/subárea configurada na sessão — isso é correto por regra de negócio
+- Um bem pode estar fisicamente em uma área diferente da que está registrada (transferências, deslocamentos)
+- O usuário configura **onde está fisicamente** (sessão atual) e escaneia o bem onde ele se encontra
+- O sistema deve **mostrar a divergência** quando a localização registrada ≠ localização da sessão
+- O usuário precisa conseguir identificar visualmente que o bem pertence a outra área/órgão
+
+### Roadmap — Flag de Deslocamento (próxima versão)
+- Quando houver divergência de localização, o usuário poderá marcar o bem como "deslocado"
+- Isso indicará que o bem foi movido para outra área/órgão desde o último inventário
+- Definições detalhadas a serem especificadas em próxima iteração
+
 ## Princípios de Código
 
 Todo código novo ou refatorado deve seguir esses princípios. São critérios de revisão obrigatórios antes de qualquer commit.
