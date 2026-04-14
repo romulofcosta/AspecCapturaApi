@@ -7,6 +7,32 @@
 - Trabalha em dois ambientes: notebook pessoal e máquina do trabalho
 - Usa o Kiro como parceiro de desenvolvimento — espera respostas diretas, sem enrolação, com foco em qualidade e boas práticas
 
+## Estado Atual do Projeto (v0.11.2)
+
+### O que está funcionando
+- Login com formato `municipio.nome.sobrenome` autenticando via API → S3
+- Sincronização de tombamentos em lotes (chunking) após login
+- Configuração de sessão: seleção de Órgão → UO → Área → Subárea
+- Scan com loop de reconhecimento em tempo real (BarcodeDetector nativo + fallback OCR)
+- Feedback visual do scan: estados scanning/detecting/found/error com timeout de 15s
+- Deploy automático: Cloudflare Pages (frontend) + Render (backend, `autoDeploy: true`)
+- 14 testes de integração passando
+
+### Pendente de validação (teste manual em stage)
+- Scan em tempo real — implementado em v0.11.2, ainda não testado no celular
+- OCR e Barcode — reportados como não funcionando na versão anterior; nova implementação aguarda teste
+
+### Problemas conhecidos / limitações
+- `wasm-tools` não instalado no notebook do Rômulo (disco cheio) — build local falha com NETSDK1147
+- Render plano free hiberna — primeira requisição demora até 50s
+- `BarcodeDetector` nativo não disponível no Safari/iOS — fallback OCR acionado automaticamente
+- Variáveis AWS em dois formatos paralelos (`AWS__*` e `AWS_*`) — débito técnico
+
+### Roadmap próxima iteração
+- Flag de "deslocamento" quando bem escaneado está em área diferente da sessão
+- Simplificação das variáveis de ambiente AWS
+- Corrigir warnings ASP0019 no `SecurityHeadersMiddleware`
+
 ## O que é este projeto
 
 **AspecCapturaApi** é o backend do sistema de inventário patrimonial público **Aspec Captura**. É uma ASP.NET Core Minimal API que serve como:
