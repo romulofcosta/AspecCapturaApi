@@ -90,7 +90,7 @@ Isso viola DRY e aumenta superfície de erro. O mapeamento bidirecional em `Prog
 
 Resultado: uma única fonte de verdade via `IConfiguration`, sem mapeamento manual.
 
-> ⚠️ Lição aprendida: o nome do bucket S3 é case-sensitive e typo silencioso.
+> ⚠️ Lição aprendida: nome de bucket S3 é exato — um typo de uma letra aponta para um bucket inexistente.
 > `aspec-captura` ≠ `aspec-capture` — o erro retornado é genérico (`Município não encontrado`)
 > porque o S3 retorna 404 tanto para bucket errado quanto para arquivo inexistente.
 > Sempre validar o `AWS__BucketName` contra o nome exato no console AWS antes do deploy.
