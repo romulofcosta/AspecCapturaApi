@@ -5,18 +5,18 @@ FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
 
 # Copiar arquivo de projeto e restaurar dependências
-COPY ["pwa-camera-poc-api.csproj", "./"]
-RUN dotnet restore "pwa-camera-poc-api.csproj"
+COPY ["AspecCapturaApi.csproj", "./"]
+RUN dotnet restore "AspecCapturaApi.csproj"
 
 # Copiar todo o código fonte e compilar
 COPY . .
-RUN dotnet build "pwa-camera-poc-api.csproj" -c Release -o /app/build
+RUN dotnet build "AspecCapturaApi.csproj" -c Release -o /app/build
 
 # ============================================
 # Stage 2: Publish
 # ============================================
 FROM build AS publish
-RUN dotnet publish "pwa-camera-poc-api.csproj" -c Release -o /app/publish /p:UseAppHost=false
+RUN dotnet publish "AspecCapturaApi.csproj" -c Release -o /app/publish /p:UseAppHost=false
 
 # ============================================
 # Stage 3: Runtime
@@ -47,4 +47,4 @@ ENV ASPNETCORE_URLS=http://+:8080 \
     DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
 
 # Entrypoint
-ENTRYPOINT ["dotnet", "pwa-camera-poc-api.dll"]
+ENTRYPOINT ["dotnet", "AspecCapturaApi.dll"]
