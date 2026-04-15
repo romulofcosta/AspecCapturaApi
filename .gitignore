@@ -301,6 +301,9 @@ coverage*.info
 .vscode/
 *.code-workspace
 
+# Kiro — Contexto pessoal do desenvolvedor (NÃO vai pro repositório corporativo)
+.kiro/
+
 # Visual Studio Code
 .vscode/*
 !.vscode/settings.json
