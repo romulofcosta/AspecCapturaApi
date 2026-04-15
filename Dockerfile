@@ -24,6 +24,11 @@ RUN dotnet publish "AspecCapturaApi.csproj" -c Release -o /app/publish /p:UseApp
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final
 WORKDIR /app
 
+# Instalar ICU para suporte a globalização (necessário para strings com acentos/cedilha)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libicu-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Criar usuário não-root para segurança
 RUN addgroup --system --gid 1001 appuser && \
     adduser --system --uid 1001 --ingroup appuser appuser

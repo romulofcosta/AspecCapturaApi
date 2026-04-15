@@ -4,9 +4,8 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.ResponseCompression;
 using Microsoft.Extensions.Caching.Memory;
 using AspecCapturaApi.Models;
-using System.Buffers;
+using AspecCapturaApi.Validators;
 using System.IO.Compression;
-using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -102,9 +101,10 @@ builder.Services.AddSingleton<IAmazonS3>(sp =>
     {
         RegionEndpoint = Amazon.RegionEndpoint.GetBySystemName(
             Environment.GetEnvironmentVariable("AWS_REGION") ?? "us-east-2"),
-        Timeout = TimeSpan.FromSeconds(60),
-        MaxErrorRetry = 2,
-        UseAccelerateEndpoint = true  // Roteia via edge location mais próxima (reduz latência Brasil→Ohio)
+        Timeout = TimeSpan.FromSeconds(25),  // Menor que o timeout do Render (30s)
+        MaxErrorRetry = 1,                   // 1 retry — 2 causava triplicar latência em falha
+        // UseAccelerateEndpoint removido — requer habilitação explícita no bucket S3
+        // Se necessário, habilitar via variável de ambiente ENABLE_S3_ACCELERATE=true
     };
     var credentials = new Amazon.Runtime.BasicAWSCredentials(
         Environment.GetEnvironmentVariable("AWS_ACCESS_KEY_ID") ?? builder.Configuration["AWS:AccessKey"],
@@ -114,9 +114,10 @@ builder.Services.AddSingleton<IAmazonS3>(sp =>
 });
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
-// Lê origens permitidas da variável de ambiente ALLOWED_ORIGINS (separadas por vírgula)
-// Fallback: permite qualquer subdomínio *.pages.dev (Cloudflare Pages)
-var allowedOriginsEnv = Environment.GetEnvironmentVariable("ALLOWED_ORIGINS") ?? string.Empty;
+// Lê origens permitidas do appsettings (não-sensível) ou variável de ambiente (Render/prod)
+var allowedOriginsEnv = Environment.GetEnvironmentVariable("ALLOWED_ORIGINS")
+    ?? builder.Configuration["AllowedOrigins"]
+    ?? string.Empty;
 var allowedOriginsList = allowedOriginsEnv
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
     .Select(o => o.ToLowerInvariant())
@@ -163,8 +164,14 @@ builder.Services.AddResponseCompression(options =>
 {
     options.EnableForHttps = true;
     options.Providers.Add<BrotliCompressionProvider>();
+    options.Providers.Add<GzipCompressionProvider>();  // Fallback para navegadores antigos
 });
-builder.Services.Configure<BrotliCompressionProviderOptions>(o => o.Level = CompressionLevel.Fastest);
+
+// ADR-002: Otimizar compressão (Fastest → Optimal)
+// Ganho: 36MB → 9MB (75%) ao invés de 36MB → 14MB (61%)
+// Trade-off: +100ms CPU servidor, -20s download em 3G
+builder.Services.Configure<BrotliCompressionProviderOptions>(o => o.Level = CompressionLevel.Optimal);
+builder.Services.Configure<GzipCompressionProviderOptions>(o => o.Level = CompressionLevel.Optimal);
 builder.Services.AddMemoryCache();
 
 // Configuração de JSON para Minimal APIs
@@ -176,13 +183,6 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.AllowTrailingCommas = true;
     options.SerializerOptions.ReadCommentHandling = JsonCommentHandling.Skip;
 });
-
-builder.Services.AddControllers()
-    .AddJsonOptions(options =>
-    {
-        options.JsonSerializerOptions.MaxDepth = 0; // sem limite de profundidade
-        options.JsonSerializerOptions.DefaultBufferSize = 16 * 1024 * 1024; // 16 MB, ajuste conforme necessário
-    });
 
 // ─── SECURITY: Authentication & Authorization ─────────────────────────────────
 // Registrar AuthService
@@ -196,7 +196,6 @@ if (jwtSecret.Length < 32)
 {
     Console.WriteLine("⚠️  WARNING: JWT_SECRET is too short. Use at least 256 bits (32 characters) for production!");
 }
-
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
     {
@@ -205,16 +204,20 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateIssuerSigningKey = true,
             IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),
             ValidateIssuer = true,
-            ValidIssuer = Environment.GetEnvironmentVariable("JWT_ISSUER") ?? "aspec-capture-api",
+            // Lê do appsettings (não-sensível) com fallback para env var (Render/prod)
+            ValidIssuer = Environment.GetEnvironmentVariable("JWT_ISSUER")
+                ?? builder.Configuration["Security:JwtIssuer"]
+                ?? "aspec-capture-api",
             ValidateAudience = true,
-            ValidAudience = Environment.GetEnvironmentVariable("JWT_AUDIENCE") ?? "aspec-capture-client",
+            ValidAudience = Environment.GetEnvironmentVariable("JWT_AUDIENCE")
+                ?? builder.Configuration["Security:JwtAudience"]
+                ?? "aspec-capture-client",
             ValidateLifetime = true,
-            ClockSkew = TimeSpan.Zero // Sem tolerância de tempo para expiração
+            ClockSkew = TimeSpan.Zero
         };
     });
 
 builder.Services.AddAuthorization();
-
 
 var app = builder.Build();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
@@ -314,8 +317,10 @@ catch (Exception ex)
 }
 
 // ─── ENDPOINT: Presigned URL ──────────────────────────────────────────────────
-app.MapPost("/api/storage/presigned-url", async (
+app.MapPost("/api/storage/presigned-url",
+    [Authorize] async (
     [FromBody] PresignedUrlRequest request,
+    ClaimsPrincipal user,
     [FromServices] IAmazonS3 s3Client,
     [FromServices] IConfiguration configuration,
     ILogger<Program> log) =>
@@ -381,10 +386,12 @@ app.MapPost("/api/storage/presigned-url", async (
 })
 .WithName("GetPresignedUrl")
 .WithOpenApi()
-.WithTags("Storage");
+.WithTags("Storage")
+.RequireAuthorization();
 
 // ─── ENDPOINT: Verifica existência no S3 ─────────────────────────────────────
-app.MapGet("/api/storage/exists/{*filePath}", async (
+app.MapGet("/api/storage/exists/{*filePath}",
+    [Authorize] async (
     string filePath,
     [FromServices] IAmazonS3 s3Client,
     [FromServices] IConfiguration configuration,
@@ -393,6 +400,13 @@ app.MapGet("/api/storage/exists/{*filePath}", async (
     var bucketName = configuration["AWS:BucketName"];
     if (string.IsNullOrEmpty(bucketName))
         return Results.Problem("Bucket não configurado.");
+
+    // Validar path para prevenir path traversal e enumeração arbitrária
+    if (!InputValidator.IsValidS3Key(filePath))
+    {
+        log.LogWarning("Tentativa de acesso com path inválido: {FilePath}", filePath);
+        return Results.BadRequest(new { error = "Caminho inválido." });
+    }
 
     try
     {
@@ -418,10 +432,13 @@ app.MapGet("/api/storage/exists/{*filePath}", async (
 })
 .WithName("CheckObjectExists")
 .WithOpenApi()
-.WithTags("Storage");
+.WithTags("Storage")
+.RequireAuthorization();
 
-app.MapGet("/api/tombamentos/localizacoes", async (
+app.MapGet("/api/tombamentos/localizacoes",
+    [Authorize] async (
     [FromQuery] string prefix,
+    ClaimsPrincipal user,
     [FromServices] IAmazonS3 s3,
     [FromServices] IConfiguration config,
     [FromServices] IMemoryCache cache,
@@ -433,6 +450,20 @@ app.MapGet("/api/tombamentos/localizacoes", async (
             return Results.BadRequest(new { error = "prefix é obrigatório" });
 
         var upper = prefix.Trim().ToUpperInvariant();
+
+        // Validar formato do prefix
+        if (!InputValidator.IsValidPrefix(upper))
+            return Results.BadRequest(new { error = "Formato de prefix inválido. Use: XX999 (ex: CE999)" });
+
+        // Validar autorização — usuário só acessa seu município
+        var userPrefix = user.FindFirst("prefix")?.Value;
+        if (userPrefix != upper)
+        {
+            log.LogWarning("Unauthorized localizacoes: user {User} tried to access {Prefix}", 
+                user.Identity?.Name, upper);
+            return Results.Forbid();
+        }
+
         var key = $"usuarios/{upper}.json";
 
         var bucket = config["AWS:BucketName"];
@@ -484,7 +515,8 @@ app.MapGet("/api/tombamentos/localizacoes", async (
 })
 .WithName("GetLocalizacoes")
 .WithOpenApi()
-.WithTags("Tombamentos");
+.WithTags("Tombamentos")
+.RequireAuthorization();
 
 
 // ─── ENDPOINT: Login ──────────────────────────────────────────────────────────
@@ -663,8 +695,11 @@ app.MapPost("/api/auth/login", async (
 .WithOpenApi()
 .WithTags("Auth");
 
-app.MapGet("/api/tombamentos/sync-info", async (
+// ─── ENDPOINT: GET /api/tombamentos (ADR-002: Carga única simplificada) ──────
+app.MapGet("/api/tombamentos", 
+    [Authorize] async (
     [FromQuery] string prefix,
+    ClaimsPrincipal user,
     [FromServices] IAmazonS3 s3,
     [FromServices] IConfiguration config,
     [FromServices] IMemoryCache cache,
@@ -674,126 +709,71 @@ app.MapGet("/api/tombamentos/sync-info", async (
     {
         if (string.IsNullOrWhiteSpace(prefix))
         {
-            log.LogWarning("SyncInfo: prefix vazio ou nulo");
+            log.LogWarning("Tombamentos: prefix vazio ou nulo");
             return Results.BadRequest(new { error = "prefix é obrigatório" });
         }
-        
-        var key = $"usuarios/{prefix.ToUpper()}.json";
-        log.LogInformation("SyncInfo: Processando key={Key}", key);
 
+        // ─── SECURITY: Validar autorização (usuário só acessa seu município) ─────
+        var userPrefix = user.FindFirst("prefix")?.Value;
+        if (userPrefix != prefix.ToUpper())
+        {
+            log.LogWarning("Unauthorized: user {User} tried to access {Prefix}", 
+                user.Identity?.Name, prefix);
+            return Results.Forbid();
+        }
+
+        var key = $"usuarios/{prefix.ToUpper()}.json";
         var bucket = config["AWS:BucketName"];
+        
         if (string.IsNullOrEmpty(bucket))
         {
-            log.LogError("SyncInfo: Bucket não configurado");
+            log.LogError("Tombamentos: Bucket não configurado");
             return Results.Problem("Bucket não configurado.");
         }
 
-        // Verifica se o arquivo existe antes de processar
+        // Verifica se o arquivo existe
+        GetObjectMetadataResponse head;
         try
         {
-            await s3.GetObjectMetadataAsync(bucket, key);
+            head = await s3.GetObjectMetadataAsync(bucket, key);
         }
         catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
-            log.LogWarning("SyncInfo: Arquivo não encontrado: {Key}", key);
-            return Results.NotFound(new { error = $"Arquivo {key} não encontrado no bucket {bucket}" });
+            log.LogWarning("Tombamentos: Arquivo não encontrado: {Key}", key);
+            return Results.NotFound(new { error = $"Prefixo '{prefix}' não encontrado" });
         }
 
-        var index = await BuildOrGetChunkIndexAsync(s3, bucket, key, cache, log);
+        var version = (head.LastModified ?? DateTime.UtcNow).ToUniversalTime().ToString("yyyyMMddHHmmss");
         
-        log.LogInformation("SyncInfo: Sucesso - {TotalRegistros} registros, {TotalChunks} chunks", 
-            index.TotalRecords, index.Chunks.Count);
+        // Carrega dados unificados (reutiliza cache existente)
+        var data = await GetOrLoadUnifiedDataAsync(s3, bucket, key, version, cache, jsonOptions, log);
         
-        return Results.Ok(new
-        {
-            totalRegistros = index.TotalRecords,
-            totalChunks = index.Chunks.Count,
-            versao = index.Version,
-            hashGlobal = index.GlobalHash
-        });
+        // Filtra tombamentos por exercício fiscal corrente
+        var exercicioCorrente = DateTime.Now.Year;
+        var tombamentos = data.Tabelas?.Tombamentos?
+            .Where(t => t.ExercicioFiscal == exercicioCorrente || t.ExercicioFiscal == 0)
+            .ToList() ?? new List<TombamentoRecord>();
+
+        log.LogInformation("Tombamentos: Retornando {Count} registros para {Prefix} (versão {Version})", 
+            tombamentos.Count, prefix, version);
+
+        // Retorna tombamentos (middleware comprime automaticamente com Brotli Optimal)
+        return Results.Ok(tombamentos);
     }
     catch (Exception ex)
     {
-        log.LogError(ex, "SyncInfo: Erro ao processar sync-info para prefix={Prefix}", prefix);
+        log.LogError(ex, "Tombamentos: Erro ao processar para prefix={Prefix}", prefix);
         return Results.Problem(
-            title: "Erro ao processar sync-info",
+            title: "Erro ao carregar tombamentos",
             detail: ex.Message,
             statusCode: 500
         );
     }
 })
-.WithName("TombamentosSyncInfo")
+.WithName("GetTombamentos")
 .WithOpenApi()
-.WithTags("Tombamentos");
-
-app.MapGet("/api/tombamentos/lote/{id:int}", async (
-    int id,
-    [FromQuery] string prefix,
-    [FromServices] IAmazonS3 s3,
-    [FromServices] IConfiguration config,
-    [FromServices] IMemoryCache cache,
-    ILogger<Program> log) =>
-{
-    try
-    {
-        if (string.IsNullOrWhiteSpace(prefix))
-        {
-            log.LogWarning("Lote: prefix vazio ou nulo");
-            return Results.BadRequest(new { error = "prefix é obrigatório" });
-        }
-        
-        var key = $"usuarios/{prefix.ToUpper()}.json";
-        log.LogInformation("Lote: Processando chunk {ChunkId} para key={Key}", id, key);
-
-        var bucket = config["AWS:BucketName"];
-        if (string.IsNullOrEmpty(bucket))
-        {
-            log.LogError("Lote: Bucket não configurado");
-            return Results.Problem("Bucket não configurado.");
-        }
-
-        var index = await BuildOrGetChunkIndexAsync(s3, bucket, key, cache, log);
-        
-        if (id < 1 || id > index.Chunks.Count)
-        {
-            log.LogWarning("Lote: ChunkId {ChunkId} inválido (total: {Total})", id, index.Chunks.Count);
-            return Results.NotFound(new { error = $"chunkId {id} inválido (total: {index.Chunks.Count})" });
-        }
-        
-        var chunkMeta = index.Chunks[id - 1];
-        var cacheKey = $"TOMB-CHUNK:{bucket}:{key}:{index.Version}:{id}";
-        
-        if (!cache.TryGetValue<byte[]>(cacheKey, out var payload))
-        {
-            log.LogInformation("Lote: Gerando payload para chunk {ChunkId}", id);
-            // Obtém o UnifiedDataRecord do cache (ou S3 se não estiver em cache)
-            // BuildOrGetChunkIndexAsync já garantiu que a versão está disponível
-            var head = await s3.GetObjectMetadataAsync(bucket, key);
-            var version2 = (head.LastModified ?? DateTime.UtcNow).ToUniversalTime().ToString("yyyyMMddHHmmss");
-            var unifiedData = await GetOrLoadUnifiedDataAsync(s3, bucket, key, version2, cache, index.Options, log);
-            payload = await SerializeChunkPayloadAsync(unifiedData, chunkMeta, index.Options);
-            cache.Set(cacheKey, payload, TimeSpan.FromHours(1));
-        }
-        else
-        {
-            log.LogInformation("Lote: Usando payload em cache para chunk {ChunkId}", id);
-        }
-        
-        return Results.Bytes(payload!, "application/json");
-    }
-    catch (Exception ex)
-    {
-        log.LogError(ex, "Lote: Erro ao processar chunk {ChunkId} para prefix={Prefix}", id, prefix);
-        return Results.Problem(
-            title: "Erro ao processar lote",
-            detail: ex.Message,
-            statusCode: 500
-        );
-    }
-})
-.WithName("TombamentosChunk")
-.WithOpenApi()
-.WithTags("Tombamentos");
+.WithTags("Tombamentos")
+.RequireAuthorization();
 
 // ─── ENDPOINT: POST /api/capture/item ────────────────────────────────────────
 app.MapPost("/api/capture/item", 
@@ -925,9 +905,11 @@ app.MapPost("/api/capture/item",
 .RequireAuthorization();  // ✅ Garante que autenticação seja aplicada
 
 // ─── ENDPOINT: GET /api/capture/validate/{nutomb} ────────────────────────────
-app.MapGet("/api/capture/validate/{nutomb}", async (
+app.MapGet("/api/capture/validate/{nutomb}",
+    [Authorize] async (
     string nutomb,
     [FromQuery] string? prefix,
+    ClaimsPrincipal user,
     [FromServices] IAmazonS3 s3,
     [FromServices] IConfiguration config,
     [FromServices] IMemoryCache cache,
@@ -936,11 +918,26 @@ app.MapGet("/api/capture/validate/{nutomb}", async (
     if (string.IsNullOrWhiteSpace(prefix))
         return Results.BadRequest(new { error = "prefix é obrigatório." });
 
+    var upperPrefix = prefix.ToUpperInvariant();
+
+    // Validar formato do prefix
+    if (!InputValidator.IsValidPrefix(upperPrefix))
+        return Results.BadRequest(new { error = "Formato de prefix inválido. Use: XX999 (ex: CE999)" });
+
+    // Validar autorização — usuário só acessa seu município
+    var userPrefix = user.FindFirst("prefix")?.Value;
+    if (userPrefix != upperPrefix)
+    {
+        log.LogWarning("Unauthorized validate: user {User} tried to access {Prefix}", 
+            user.Identity?.Name, upperPrefix);
+        return Results.Forbid();
+    }
+
     var bucket = config["AWS:BucketName"];
     if (string.IsNullOrEmpty(bucket))
         return Results.Problem("Bucket não configurado.");
 
-    var s3Key = $"usuarios/{prefix.ToUpper()}.json";
+    var s3Key = $"usuarios/{upperPrefix}.json";
 
     try
     {
@@ -992,7 +989,8 @@ app.MapGet("/api/capture/validate/{nutomb}", async (
 })
 .WithName("ValidateTombamento")
 .WithOpenApi()
-.WithTags("Capture");
+.WithTags("Capture")
+.RequireAuthorization();
 
 // ─── ENDPOINT: GET /api/capture/list ─────────────────────────────────────────
 app.MapGet("/api/capture/list", 
@@ -1418,216 +1416,6 @@ static async Task InvalidateCacheForPrefixAsync(
         // Falha na invalidação não deve bloquear a resposta ao cliente
         log.LogWarning(ex, "Falha ao invalidar cache para {S3Key}: {Message}", s3Key, ex.Message);
     }
-}
-
-static async Task<ChunkIndex> BuildOrGetChunkIndexAsync(IAmazonS3 s3, string bucket, string key, IMemoryCache cache, ILogger? log = null)
-{
-    try
-    {
-        var head = await s3.GetObjectMetadataAsync(bucket, key);
-        var dt = head.LastModified ?? DateTime.UtcNow;
-        var version = dt.ToUniversalTime().ToString("yyyyMMddHHmmss");
-        var cacheKey = $"TOMB-INDEX:{bucket}:{key}:{version}";
-        
-        if (cache.TryGetValue<ChunkIndex>(cacheKey, out var cached) && cached is not null)
-        {
-            log?.LogInformation("BuildOrGetChunkIndexAsync: Usando index em cache para {Key}", key);
-            return cached;
-        }
-        
-        log?.LogInformation("BuildOrGetChunkIndexAsync: Construindo index para {Key}", key);
-        
-        var options = new JsonSerializerOptions
-        {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-        };
-        var chunks = new List<ChunkMeta>();
-        var sha256 = SHA256.Create();
-        var globalHashCtx = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        var total = 0;
-        var current = new List<TombamentoRecord>();
-        
-        const int MaxItemsPerChunk = 5000;
-        
-        var unifiedData = await GetOrLoadUnifiedDataAsync(s3, bucket, key, version, cache, options, log);
-        var itens = unifiedData.Tabelas?.Tombamentos?.ToList();
-        
-        if (itens is null || itens.Count == 0)
-        {
-            log?.LogWarning("BuildOrGetChunkIndexAsync: Nenhum tombamento encontrado em {Key}", key);
-            var emptyIndex = new ChunkIndex(version, 0, "", new List<ChunkMeta>(), options);
-            cache.Set(cacheKey, emptyIndex, TimeSpan.FromHours(1));
-            return emptyIndex;
-        }
-
-        var exercicioCorrente = DateTime.Now.Year;
-        var itensFiltrados = itens
-            .Where(p => p.ExercicioFiscal == exercicioCorrente || p.ExercicioFiscal == 0)
-            .ToList();
-
-        log?.LogInformation("BuildOrGetChunkIndexAsync: Processando {Total} tombamentos (filtrados: {Filtrados})", 
-            itens.Count, itensFiltrados.Count);
-
-        foreach (var item in itensFiltrados)
-        {
-            if (item is null) continue;
-            current.Add(item);
-            total++;
-            
-            if (current.Count >= MaxItemsPerChunk)
-            {
-                await FinalizeChunkAsync(current, total, sha256, globalHashCtx, chunks, options);
-                current.Clear();
-            }
-        }
-        
-        if (current.Count > 0)
-        {
-            await FinalizeChunkAsync(current, total, sha256, globalHashCtx, chunks, options);
-        }
-        
-        var globalHash = Convert.ToHexString(globalHashCtx.GetHashAndReset());
-        var index = new ChunkIndex(version, total, globalHash, chunks, options);
-        cache.Set(cacheKey, index, TimeSpan.FromHours(1));
-        
-        log?.LogInformation("BuildOrGetChunkIndexAsync: Index construído com sucesso - {Total} registros, {Chunks} chunks", 
-            total, chunks.Count);
-        
-        return index;
-    }
-    catch (Exception ex)
-    {
-        log?.LogError(ex, "BuildOrGetChunkIndexAsync: Erro ao construir index para {Key}", key);
-        throw;
-    }
-}
-
-// ─── METODO AUXILIAR: FINALIZA CHUNK ─────────────────────────────────────────
-static async Task FinalizeChunkAsync(
-    List<TombamentoRecord> buffer, 
-    int totalProcessed, 
-    SHA256 sha256, 
-    IncrementalHash globalHashCtx, 
-    List<ChunkMeta> chunks, 
-    JsonSerializerOptions options)
-{
-    // Serializa apenas uma vez quando o chunk esta completo
-    var jsonBytes = JsonSerializer.SerializeToUtf8Bytes(buffer, options);
-    var hash = Convert.ToHexString(sha256.ComputeHash(jsonBytes));
-    globalHashCtx.AppendData(Convert.FromHexString(hash));
-    chunks.Add(new ChunkMeta(totalProcessed - buffer.Count + 1, buffer.Count, hash));
-    
-    // Log opcional para monitoramento
-    Console.WriteLine($"[CHUNK] Finalizado: {buffer.Count} registros, {jsonBytes.Length / 1024} KB");
-    await Task.CompletedTask; // Placeholder para operacoes async futuras
-}
-
-// ─── ESTRATEGIA 2: ESTIMATIVA DE TAMANHO (ALTERNATIVA) ───────────────────────
-// Descomente para usar estimativa ao inves de batching fixo
-/*
-static int EstimateChunkSize(List<TombamentoRecord> sampleBuffer, int targetCompressedBytes, JsonSerializerOptions options)
-{
-    // Amostra os primeiros 100 registros para estimar tamanho medio
-    const int SampleSize = 100;
-    if (sampleBuffer.Count < SampleSize) return 5000; // Fallback
-    
-    var sample = sampleBuffer.Take(SampleSize).ToList();
-    var sampleJson = JsonSerializer.SerializeToUtf8Bytes(sample, options);
-    
-    using var ms = new MemoryStream();
-    using (var brotli = new BrotliStream(ms, CompressionLevel.Fastest))
-    {
-        brotli.Write(sampleJson);
-    }
-    
-    var avgCompressedBytesPerRecord = ms.Length / SampleSize;
-    var estimatedChunkSize = (int)(targetCompressedBytes / avgCompressedBytesPerRecord * 0.9); // 90% margem
-    
-    return Math.Max(1000, Math.Min(estimatedChunkSize, 10000)); // Entre 1k-10k
-}
-*/
-
-// ─── ESTRATEGIA 3: ESCRITA INCREMENTAL (AVANCADA) ────────────────────────────
-// Descomente para usar escrita incremental com Utf8JsonWriter
-/*
-static async Task<bool> ExceedsTargetIncrementalAsync(
-    List<TombamentoRecord> buffer, 
-    int targetCompressedBytes, 
-    JsonSerializerOptions options)
-{
-    await using var ms = new MemoryStream();
-    await using var brotli = new BrotliStream(ms, CompressionLevel.Fastest, leaveOpen: true);
-    await using var writer = new Utf8JsonWriter(brotli, new JsonWriterOptions { Indented = false });
-    
-    writer.WriteStartArray();
-    foreach (var record in buffer)
-    {
-        JsonSerializer.Serialize(writer, record, options);
-    }
-    writer.WriteEndArray();
-    await writer.FlushAsync();
-    await brotli.FlushAsync();
-    
-    return ms.Length >= targetCompressedBytes && buffer.Count > 0;
-}
-*/
-
-// ─── METODO LEGADO (DEPRECATED) ──────────────────────────────────────────────
-// AVISO: Este metodo causa O(n²) - NAO USAR EM PRODUCAO
-// Mantido apenas como referencia historica do problema de performance
-/*
-static async Task<bool> ExceedsTargetAsync(List<TombamentoRecord> buffer, int targetCompressedBytes, JsonSerializerOptions options)
-{
-    // ⚠️ DEPRECATED: Causa gargalo de performance (14 min para 42 MB)
-    // Use FinalizeChunkAsync com batching fixo ao inves deste metodo
-    var jsonBytes = JsonSerializer.SerializeToUtf8Bytes(buffer, options);
-    await using var ms = new MemoryStream();
-    await using (var brotli = new BrotliStream(ms, CompressionLevel.Fastest, leaveOpen: true))
-    {
-        await brotli.WriteAsync(jsonBytes);
-    }
-    return ms.Length >= targetCompressedBytes && buffer.Count > 0;
-}
-*/
-
-static Task<byte[]> SerializeChunkPayloadAsync(UnifiedDataRecord data, ChunkMeta meta, JsonSerializerOptions options)
-{
-    var result = new
-    {
-        chunkId = (int)((meta.Start - 1) / meta.Count) + 1,
-        data = new List<TombamentoRecord>(meta.Count),
-        hash = meta.Hash
-    };
-
-    var allItems = data.Tabelas?.Tombamentos?.ToList();
-
-    if (allItems is null || allItems.Count == 0)
-    {
-        Console.WriteLine($"[AVISO] SerializeChunkPayload: Nenhum tombamento encontrado");
-        return Task.FromResult(JsonSerializer.SerializeToUtf8Bytes(result, options));
-    }
-
-    // Aplica filtro de exercício fiscal corrente
-    var exercicioCorrente = DateTime.Now.Year;
-    var itemsFiltrados = allItems
-        .Where(p => p.ExercicioFiscal == exercicioCorrente || p.ExercicioFiscal == 0)
-        .ToList();
-
-    var start = meta.Start;
-    var end = meta.Start + meta.Count - 1;
-
-    // Extrai apenas os itens do chunk especificado
-    for (int i = start - 1; i < end && i < itemsFiltrados.Count; i++)
-    {
-        var item = itemsFiltrados[i];
-        if (item is not null)
-            result.data.Add(item);
-    }
-
-    Console.WriteLine($"[INFO] SerializeChunkPayload: Chunk {result.chunkId} com {result.data.Count} registros");
-
-    return Task.FromResult(JsonSerializer.SerializeToUtf8Bytes(result, options));
 }
 
 // Required for WebApplicationFactory<Program> in integration tests

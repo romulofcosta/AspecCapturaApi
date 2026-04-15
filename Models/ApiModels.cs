@@ -193,6 +193,3 @@ public record OrgaoRecord(string IdOrgao, string NomeOrgao, List<UnidadeOrcament
 public record UnidadeOrcamentariaRecord(string IdUO, string NomeUO, List<AreaRecord> Areas);
 public record AreaRecord(string IdArea, string NomeArea, List<SubareaRecord> Subareas);
 public record SubareaRecord(string IdSubarea, string NomeSubarea);
-
-record ChunkMeta(int Start, int Count, string Hash);
-record ChunkIndex(string Version, int TotalRecords, string GlobalHash, List<ChunkMeta> Chunks, System.Text.Json.JsonSerializerOptions Options);

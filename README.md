@@ -1,9 +1,48 @@
-# pwa-camera-poc-api
+# AspecCapturaApi
 
-API Backend (Minimal API .NET 8) que dá suporte ao PWA de Inventário Patrimonial. Atua como BFF (Backend for Frontend) para:
-- Autenticação de usuários via arquivos JSON no S3 (Authentication Broker).
-- Geração de Pre-Signed URLs para upload direto ao S3.
-- Resposta de login com dados hierárquicos de tombamentos de forma eficiente (streaming + compressão).
+API Backend (Minimal API .NET 8) que dá suporte ao PWA de Inventário Patrimonial **Aspec Captura**. Atua como BFF (Backend for Frontend) para:
+- Autenticação de usuários via arquivos JSON no S3 (Authentication Broker)
+- Geração de Pre-Signed URLs para upload direto ao S3
+- Sincronização de tombamentos com compressão Brotli (ADR-002)
+
+## Configuração Local
+
+### Pré-requisitos
+- .NET 8 SDK
+- Acesso a uma conta AWS com permissões de S3 (`s3:GetObject`, `s3:PutObject` no bucket `aspec-captura`)
+
+### Variáveis de Ambiente
+
+Copie `.env.example` para `.env` e preencha com suas credenciais:
+
+```bash
+cp .env.example .env
+```
+
+**`.env` (apenas secrets — nunca commitar):**
+```
+AWS_ACCESS_KEY_ID=sua_access_key
+AWS_SECRET_ACCESS_KEY=seu_secret_key
+JWT_SECRET=$(openssl rand -base64 64)
+```
+
+**`appsettings.Development.json` (configurações não-sensíveis — já versionado):**
+```json
+{
+  "AWS": { "Region": "us-east-2", "BucketName": "aspec-captura" },
+  "Security": { "JwtIssuer": "aspec-capture-api", "JwtAudience": "aspec-capture-client" }
+}
+```
+
+> ⚠️ **NUNCA** coloque credenciais AWS ou JWT_SECRET no `appsettings.json` ou `appsettings.Development.json`.
+
+### Execução
+
+```bash
+dotnet run
+```
+
+Swagger UI disponível em: `http://localhost:5069/swagger`
 
 ##  Arquitetura
 

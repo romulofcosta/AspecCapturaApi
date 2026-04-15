@@ -49,11 +49,22 @@ public class ValidateEndpointTests : IClassFixture<CaptureTestFactory>
     }
 
     [Fact]
-    public async Task ValidateTombamento_Returns404_WhenPrefixInvalid()
+    public async Task ValidateTombamento_Returns400_WhenPrefixFormatInvalid()
     {
+        // "INVALID" não passa na validação de formato (^[A-Z]{2}\d{3}$) → 400
         var response = await _client.GetAsync("/api/capture/validate/00000005?prefix=INVALID");
 
-        response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+    }
+
+    [Fact]
+    public async Task ValidateTombamento_Returns403_WhenPrefixDoesNotMatchToken()
+    {
+        // SP001 tem formato válido mas não bate com o prefixo do token JWT (CE999)
+        // Comportamento correto: 403 Forbidden (autorização negada antes de consultar S3)
+        var response = await _client.GetAsync("/api/capture/validate/00000005?prefix=SP001");
+
+        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
     }
 
     [Fact]
